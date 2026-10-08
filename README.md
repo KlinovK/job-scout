@@ -1,462 +1,305 @@
-# Personal Job Search
+# JobScout
 
-This repository contains two intentionally separate capabilities:
+JobScout is a multi-source job discovery and intelligence platform that
+collects, normalizes, deduplicates, and classifies vacancies from heterogeneous
+ATS platforms and job boards.
 
-1. **Job Search Core (Phases 1–3B)** — a production-oriented foundation for
-   collecting, normalizing, and deterministically classifying jobs from company
-   ATS platforms.
-2. **Legacy Telegram collector** — the existing `main.py` workflow that scans
-   Telegram channels and forwards matching messages to Saved Messages.
+> **Status: Active Development** — the collection and deterministic iOS
+> classification pipeline is implemented. Selective AI-assisted analysis and
+> ranking are planned, not presented as current functionality.
 
-The new core does not integrate the two yet. This preserves the working Telegram
-collector while the new core is built behind explicit architectural boundaries.
+## Why JobScout
 
-## Phase 1 scope
+Relevant vacancies are fragmented across company ATS platforms, aggregators,
+and community channels. Each source exposes different schemas, identifiers,
+and failure modes, while the same role may appear through several paths.
+JobScout creates one normalized, provenance-aware pipeline for discovering and
+evaluating those opportunities without hiding uncertain data behind a single
+opaque score.
 
-Implemented:
+## Current Capabilities
 
-- company registry;
-- normalized `JobVacancy` domain model;
-- async SQLite persistence through SQLAlchemy 2.x;
-- Alembic database migrations;
-- `JobSource` abstraction;
-- Greenhouse Job Board API adapter;
-- collection application service with per-company failure isolation;
-- idempotent development seed;
-- CLI commands for seeding and collection;
-- deterministic offline tests;
-- Ruff, mypy, and pytest configuration.
-
-## Phase 2 scope
-
-Phase 2 adds a deterministic iOS eligibility engine:
-
-- explicit `MATCH`, `POSSIBLE_MATCH`, and `REJECT` decisions;
-- native iOS role and technology evidence;
-- seniority, Objective-C, mixed-mobile, work-mode, relocation, geography, visa,
-  language, and preferred-domain rules;
-- structured positive signals, warnings, and rejection reasons;
-- versioned classification persistence separate from `JobVacancy`;
-- idempotent reclassification;
-- CLI commands for classification and candidate inspection;
-- a curated regression corpus covering likely false positives and negatives.
-
-The engine is deliberately rule-based and explainable. It does not use an LLM,
-embeddings, machine learning, or an opaque numerical match score.
-
-## Phase 3A scope
-
-Phase 3A scales direct company collection without adding job boards or scraping:
-
-- production adapters for Greenhouse, Lever, Ashby, and Recruitee public
-  job-board APIs;
-- a validated JSON company registry stored outside Python code;
-- 82 API-verified mobile, fintech, web3, AI, and remote-oriented companies;
-- stable company identity and repeatable bulk import;
-- explicit registry provenance and verification timestamps;
-- bounded concurrent HTTP collection with serialized SQLite writes;
-- per-provider collection reports;
-- persisted source health: `healthy`, `empty`, `failed`, and
-  `invalid_configuration`;
-- CLI commands for registry import, inspection, and health review.
-
-Phase 3A does not add browser scraping, LinkedIn, hh.ru, AI analysis, Telegram
-delivery, contact enrichment, or automatic applications.
-
-## Phase 3B scope
-
-Phase 3B adds safe external discovery and deterministic cross-source
-deduplication:
-
-- official hh.ru API adapter with mandatory OAuth configuration;
-- configurable 72-hour external discovery window;
-- bounded pagination, detail concurrency, and transient retries;
-- source observations separated from the preferred canonical vacancy;
-- canonical URL and embedded ATS-reference matching;
-- official-source precedence over aggregators;
-- conservative employer/title normalization for diagnostics only;
-- provenance and duplicate diagnostics in the CLI;
-- non-destructive observation backfill for every existing vacancy.
-
-Find Dream Offer and LinkedIn were investigated but are intentionally not
-collected directly. Find Dream Offer currently exposes an undocumented,
-CAPTCHA-gated browser backend. LinkedIn has no public job-search API and its
-terms prohibit scraping and unauthorized automation. See
-[the investigation record](docs/phase-3b-source-investigation.md).
-
-## AgileFluent source extension
-
-The public AgileFluent JSON API remains the 83rd configured source; the disabled
-hh.ru external-discovery entry is the 84th registry entry.
-Collection is deliberately bounded to jobs published in the last 24 hours and
-to the user's current search profiles:
-
-- middle/senior/lead iOS and Mobile engineering;
-- intern/junior Python, Backend, and Full Stack engineering;
-- junior through lead Project, Program, Delivery, Scrum, Agile, and Technical
-  Program Management;
-- remote roles or roles in Cyprus, Georgia, the Netherlands, Poland, and the UAE.
-
-The provider currently applies role filters reliably but can ignore requested
-grades. The adapter therefore enforces grades again locally, paginates with a
-safety limit, and de-duplicates overlapping profiles by provider job ID. The
-actual employer is stored separately from the aggregator source and shown in
-candidate output. Apply tokens are not decoded or bypassed; stored links open
-the public AgileFluent job detail page.
+- **Multi-source collection:** production adapters for Greenhouse, Lever,
+  Ashby, Recruitee, AgileFluent, and the official hh.ru API.
+- **Validated company registry:** 92 configured entries across six source
+  types; 91 are enabled for the default collection workflow. The hh.ru entry is
+  disabled by default and invoked explicitly when OAuth is configured.
+- **Asynchronous ingestion:** one shared `httpx.AsyncClient`, bounded
+  per-company concurrency, and isolated provider failures so one broken source
+  does not stop the remaining collection run.
+- **Normalized domain model:** provider DTOs are validated and translated into
+  framework-independent companies, vacancies, source observations, health
+  states, and classifications.
+- **Durable provenance:** every discovered source identity is stored as an
+  observation linked to a preferred canonical vacancy.
+- **Conservative deduplication:** exact normalized application URLs and explicit
+  ATS references can collapse cross-source duplicates; similar employer/title
+  records with distinct URLs remain separate for review. Official ATS content
+  is preferred over aggregator content when observations converge.
+- **Idempotent persistence:** repeated registry imports, collections, and
+  `ios-v1` classifications update existing identities instead of creating
+  duplicate records.
+- **Explainable iOS classification:** a deterministic, versioned ruleset emits
+  `MATCH`, `POSSIBLE_MATCH`, or `REJECT` with structured signals, warnings, and
+  rejection reasons.
+- **Operational source health:** `healthy`, `empty`, `failed`, and
+  `invalid_configuration` are distinct persisted outcomes. A non-empty payload
+  whose records are all malformed fails the source rather than masquerading as
+  a legitimate empty result; mixed payloads preserve valid records.
+- **CLI workflows:** registry import and inspection, collection, external
+  collection, classification, candidate review, source health, duplicate
+  diagnostics, and vacancy provenance inspection.
+- **Legacy Telegram integration:** a separate Telethon collector scans
+  configured channels, applies its own vacancy filters, and forwards matches to
+  Saved Messages. It is intentionally not yet unified with the core pipeline.
 
 ## Architecture
 
-The new core is a modular monolith using pragmatic Clean/Hexagonal Architecture:
+JobScout is a modular monolith built around pragmatic Clean/Hexagonal
+Architecture. Business models and deterministic policy live in the domain;
+application services coordinate use cases through protocols; infrastructure
+implements HTTP, registry, and persistence boundaries; presentation provides
+the CLI composition root.
 
-```text
-presentation/cli
-       |
-       v
-application/services ----> application/ports
-       |                           ^
-       v                           |
-domain models + policy      infrastructure adapters
-                         /                         \
- Greenhouse/Lever/Ashby/Recruitee/AgileFluent/hh.ru       SQLAlchemy/SQLite
+```mermaid
+flowchart LR
+    CLI[Presentation: CLI] --> APP[Application services]
+    APP --> DOMAIN[Domain models and policy]
+    APP --> PORTS[Application ports]
+
+    INFRA[Infrastructure adapters] --> PORTS
+    INFRA --> DOMAIN
+    INFRA --> APIs[ATS and job-board APIs]
+    INFRA --> DB[(SQLite)]
+
+    CLASSIFIER[ios-v1 classifier] --> DOMAIN
 ```
 
-Dependencies point inward:
+The source-code dependency direction is deliberately inward:
 
 ```text
-infrastructure -> application -> domain
-presentation   -> application -> domain
+Infrastructure -> Application -> Domain
+Presentation   -> Application -> Domain
 ```
 
-The domain imports no SQLAlchemy, Pydantic, httpx, Telegram, OpenAI, or CLI
-framework. Provider DTOs remain inside their adapters, and ORM records remain
+The domain imports no SQLAlchemy, Pydantic, httpx, Telethon, OpenAI, or CLI
+framework. Provider DTOs stay inside source adapters, and ORM records stay
 inside the persistence adapter.
 
-## Directory structure
+The implemented collection path is:
 
 ```text
-src/job_search/
-  domain/                         Business models, enums, and iOS policy
-  application/                    Ports, result models, use cases
-  infrastructure/
-    configuration.py             Validated pydantic-settings configuration
-    persistence/sqlalchemy/       ORM records and repository adapters
-    registry/                     Validated bulk registry loader
-    sources/                      Greenhouse, Lever, Ashby, Recruitee, AgileFluent, hh adapters
-    seed.py                       Loader for data/companies.json
-  presentation/cli.py             Composition root and CLI
-data/companies.json               Versioned company registry
-migrations/                        Alembic environment and revisions
-tests/job_search/
-  unit/                            Domain, classifier, source, use-case behavior
-  integration/                     SQLite repositories and migrations
-main.py                            Existing Telegram collector (legacy)
+Public APIs -> source adapters -> CollectJobsService -> repositories -> SQLite
+                                                        |
+                                                        +-> source health
+SQLite -> ios-v1 classifier -> persisted decisions -> CLI candidate view
 ```
 
-## Requirements and setup
+The legacy Telegram collector is a parallel integration and does not currently
+write into this normalized pipeline.
 
-- Python 3.12 or newer
-- macOS, Linux, or another environment supported by Python and SQLite
+## Technology
 
-Create and install a virtual environment:
+- Python 3.12+, `asyncio`, and `httpx`
+- SQLAlchemy 2.x async with SQLite and `aiosqlite`
+- Alembic schema migrations
+- Pydantic v2 and `pydantic-settings` at untrusted/configuration boundaries
+- Telethon for the separate Telegram collector
+- pytest and pytest-asyncio
+- Ruff formatting and linting
+- mypy in strict mode for `src/job_search`
+
+FastAPI and an LLM provider are intentionally absent from the current stack.
+
+## Engineering Highlights
+
+### Explicit failure semantics
+
+An empty source is valid data; a malformed non-empty response is not. Adapters
+validate response envelopes and individual records, retain valid records from
+mixed payloads, and surface all-malformed payloads as typed source failures.
+This prevents upstream schema drift from silently looking like “no vacancies.”
+
+### Bounded concurrency with isolated failures
+
+HTTP collection runs concurrently behind an `asyncio.Semaphore`, while SQLite
+writes use a short application-level lock. This keeps network I/O efficient,
+avoids SQLite writer contention, and records per-company failures without
+cancelling unrelated work.
+
+### Provenance-first canonicalization
+
+JobScout stores both a canonical vacancy and its source observations. It merges
+only on high-confidence URL or embedded ATS identity evidence and preserves
+ambiguous records. That bias favors explainability and prevents aggressive
+fuzzy matching from combining unrelated roles.
+
+### Versioned deterministic policy
+
+The `ios-v1` classifier is explainable and reproducible. Classification records
+are keyed by `(vacancy_id, classifier_version)`, so a future policy can coexist
+with historical results instead of overwriting how a previous decision was
+made.
+
+### Typed, migration-backed boundaries
+
+Frozen domain dataclasses, application protocols, validated provider DTOs, and
+explicit database migrations keep external payloads and ORM concerns from
+leaking into business policy. Registry import is whole-file validated before
+any database write.
+
+## Quality
+
+The current repository contains **199 passing tests**, including unit,
+integration, migration, adapter-contract, canonicalization, concurrency, and
+classification regression coverage.
+
+The local quality gate runs:
+
+```bash
+make quality
+.venv/bin/alembic check
+git diff --check
+```
+
+`make quality` combines Ruff lint and format checks, strict mypy, and pytest.
+There is no CI badge because CI has not been implemented yet.
+
+## Development Status
+
+### Implemented
+
+- six HTTP source adapters and a validated 92-entry registry;
+- async normalized collection with bounded concurrency and provider isolation;
+- async SQLite persistence and Alembic migrations;
+- source observations, conservative cross-source canonicalization, and
+  duplicate diagnostics;
+- persisted source-health and malformed-source semantics;
+- deterministic `ios-v1` classification and candidate inspection;
+- a separate Telegram-to-Saved-Messages collection path;
+- strict static analysis and a 199-test automated suite.
+
+### In Progress / Next
+
+- consistent retry/backoff policy across source adapters (hh.ru already has
+  limited targeted retry behavior);
+- vacancy lifecycle reconciliation when roles disappear from a source;
+- a query layer over normalized vacancies and classifications;
+- operational hardening of scheduled collection and local runtime security.
+
+### Planned
+
+- FastAPI query surface;
+- typed contracts and an evaluation dataset for AI-assisted analysis;
+- structured LLM extraction and ranking, introduced only after evaluation;
+- unified delivery, including Telegram, from the normalized pipeline;
+- additional source integrations where official or permitted APIs exist.
+
+## AI-Assisted Engineering
+
+Coding agents are used as implementation tools inside a controlled engineering
+workflow:
+
+```text
+Requirement -> repository analysis -> scoped specification -> implementation
+            -> automated verification -> review -> remediation -> accepted commit
+```
+
+AI output is not treated as authority. Tests and static analysis check
+mechanical correctness; architecture, scope, and product intent remain subject
+to human review. Risk-sensitive iterations can add an independent adversarial
+review before acceptance. Generated changes are inspected and verified before
+they become a published commit.
+
+## Running Locally
+
+### 1. Install
+
+Requirements: Python 3.12+ and SQLite.
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -e '.[dev]'
+cp .env.example .env
 ```
 
-Copy `.env.example` to `.env` and adjust settings if needed. Do not commit the
-real `.env` file.
+Keep `.env` local. It is ignored by Git and must contain your own credentials,
+never values copied from another environment.
 
-## Local security and runtime data
-
-The project currently keeps local runtime files beside the source code for
-compatibility with the CLI and the installed `launchd` job. They are not source
-files and must not be committed or shared:
-
-| Path | Classification | Expected mode |
-|---|---|---|
-| `.env` | secret configuration | `0600` |
-| `telegram_collector.session` | sensitive Telegram session credential | `0600` |
-| `collector_state.json` | private Telegram processing state | `0600` |
-| `job_search.db` | private local job-search database | `0600` |
-| `logs/` | private operational data | `0700` |
-| `logs/*` | private Telegram metadata and diagnostics | `0600` |
-
-On macOS, verify the current modes without reading file contents:
-
-```bash
-stat -f '%Sp %N' .env telegram_collector.session collector_state.json job_search.db logs logs/*
-```
-
-If necessary, restore the expected permissions with explicit paths:
-
-```bash
-chmod 600 .env telegram_collector.session collector_state.json job_search.db
-chmod 700 logs
-chmod 600 logs/collector.log logs/collector.error.log logs/matches.jsonl
-```
-
-`telegram_collector.session` is effectively a credential: copying it may give
-another process access to the authenticated Telegram session. Do not put it in
-cloud storage, attach it to issues, or send it with logs. `.env.example` is a
-trackable template and must contain no real credentials.
-
-`job_search.db` contains local collection and classification state. It is
-ignored by Git. To make a consistent backup, ensure no collection or
-classification command is writing, then use SQLite's backup command and store
-the result outside the repository:
-
-```bash
-sqlite3 job_search.db ".backup '/private/path/job_search-backup.db'"
-```
-
-The source/configuration artifacts that should remain trackable include
-`src/`, `migrations/`, `tests/`, `docs/`, `data/companies.json`, and
-`.env.example`. This project does not assume a remote Git URL; confirm whether
-an existing private repository and history need to be recovered before
-initializing a copied working directory.
-
-## Configuration
-
-All new-core settings use the `JOB_SEARCH_` prefix:
-
-| Variable | Default |
-|---|---|
-| `JOB_SEARCH_DATABASE_URL` | `sqlite+aiosqlite:///./job_search.db` |
-| `JOB_SEARCH_LOG_LEVEL` | `INFO` |
-| `JOB_SEARCH_HTTP_CONNECT_TIMEOUT` | `5` |
-| `JOB_SEARCH_HTTP_READ_TIMEOUT` | `20` |
-| `JOB_SEARCH_HTTP_WRITE_TIMEOUT` | `10` |
-| `JOB_SEARCH_HTTP_POOL_TIMEOUT` | `5` |
-| `JOB_SEARCH_HTTP_MAX_CONNECTIONS` | `20` |
-| `JOB_SEARCH_HTTP_MAX_KEEPALIVE_CONNECTIONS` | `10` |
-| `JOB_SEARCH_COLLECTION_CONCURRENCY` | `8` |
-| `JOB_SEARCH_USER_AGENT` | `personal-job-search/0.5` |
-| `JOB_SEARCH_EXTERNAL_DISCOVERY_MAX_AGE_HOURS` | `72` |
-| `JOB_SEARCH_EXTERNAL_DISCOVERY_MAX_PAGES` | `5` |
-| `JOB_SEARCH_HH_API_TOKEN` | unset; required for hh.ru only |
-
-The core validates that the database URL uses async SQLite. The existing
-`TELEGRAM_*` variables are read only by the legacy collector.
-
-## Database migrations
-
-Apply all migrations:
+### 2. Initialize the database and registry
 
 ```bash
 .venv/bin/alembic upgrade head
-```
-
-Alembic reads the same `JOB_SEARCH_DATABASE_URL` setting as the application.
-
-Roll back the latest migration:
-
-```bash
-.venv/bin/alembic downgrade -1
-```
-
-Timestamps are stored as UTC ISO-8601 strings because SQLite has no native
-timezone-aware timestamp type. The persistence adapter always returns aware UTC
-`datetime` values.
-
-## Company registry
-
-The default registry is [`data/companies.json`](data/companies.json). Every entry
-declares its ATS type and identifier, careers URL, priority, provenance, enabled
-state, and the time its public API was verified. JSON was chosen so validation
-does not require another runtime dependency and changes remain easy to review.
-
-Import the default registry:
-
-```bash
 .venv/bin/job-search seed
 ```
 
-Import another registry file and inspect the result:
+The default database is `job_search.db`. The seed command validates and imports
+[`data/companies.json`](data/companies.json) idempotently.
 
-```bash
-.venv/bin/job-search companies import data/companies.json
-.venv/bin/job-search companies list
-.venv/bin/job-search companies health
-```
-
-Import validates the complete file before any database write. Duplicate company
-names, duplicate ATS identities, unknown fields, unsupported providers, invalid
-URLs, and timezone-naive verification timestamps reject the whole file. Company
-identity is a stable UUID derived from `(ats_type, ats_identifier)` for new
-entries. Repeated imports update registry metadata without resetting collection
-health or changing existing database identity.
-
-## Collect jobs
-
-After migrating and seeding:
+### 3. Collect, classify, and inspect
 
 ```bash
 .venv/bin/job-search collect
+.venv/bin/job-search classify
+.venv/bin/job-search candidates --limit 20
 ```
 
-Equivalent module form:
+Useful diagnostic commands:
 
 ```bash
-.venv/bin/python -m job_search collect
+.venv/bin/job-search companies list
+.venv/bin/job-search companies health
+.venv/bin/job-search duplicates
+.venv/bin/job-search vacancy sources <canonical-vacancy-uuid>
 ```
 
-The CLI creates one shared `httpx.AsyncClient`, loads enabled sources, selects
-the Greenhouse, Lever, Ashby, Recruitee, AgileFluent, or hh.ru adapter,
-normalizes jobs,
-upserts vacancies, updates source health, and prints separate provider summaries.
-
-The disabled hh.ru registry entry is collected explicitly after configuring an
-OAuth token:
+The disabled hh.ru source requires a registered OAuth token in
+`JOB_SEARCH_HH_API_TOKEN` and is run explicitly:
 
 ```bash
 .venv/bin/job-search collect-external --source hh
 ```
 
-Anonymous fallback is not attempted because current hh.ru documentation and
-live behavior make repeated anonymous search CAPTCHA-limited.
+No anonymous fallback is attempted because anonymous hh.ru vacancy search is
+CAPTCHA-limited.
 
-Inspect canonicalization and provenance:
+### Configuration
 
-```bash
-.venv/bin/job-search duplicates
-.venv/bin/job-search vacancy sources <canonical-vacancy-uuid>
-```
+Core settings use the `JOB_SEARCH_` prefix. The most useful controls are:
 
-Canonical matching uses only high-confidence evidence: normalized application
-URL or an explicit provider/ATS identifier embedded in a known URL. Tracking
-parameters and fragments are removed, but job-identifying query parameters are
-preserved. Ambiguous same-employer/title cases remain separate and are reported
-as possible duplicate groups. When an official ATS observation and an
-aggregator observation converge, official content and apply URL win while both
-observations remain inspectable.
+| Variable | Default | Purpose |
+|---|---:|---|
+| `JOB_SEARCH_DATABASE_URL` | `sqlite+aiosqlite:///./job_search.db` | Async SQLite database |
+| `JOB_SEARCH_COLLECTION_CONCURRENCY` | `8` | Concurrent company collections |
+| `JOB_SEARCH_HTTP_MAX_CONNECTIONS` | `20` | HTTP pool bound |
+| `JOB_SEARCH_EXTERNAL_DISCOVERY_MAX_AGE_HOURS` | `72` | hh.ru freshness window |
+| `JOB_SEARCH_EXTERNAL_DISCOVERY_MAX_PAGES` | `5` | hh.ru page bound per query |
+| `JOB_SEARCH_HH_API_TOKEN` | unset | Required only for hh.ru |
 
-HTTP collection is concurrent and bounded by
-`JOB_SEARCH_COLLECTION_CONCURRENCY`. SQLite writes remain serialized to avoid
-writer contention. A failure for one company is logged and reported without
-stopping other companies. Task cancellation is not swallowed.
+See [`.env.example`](.env.example) for the complete non-secret template.
 
-Health meanings:
+### Legacy Telegram collector
 
-- `healthy`: the configured source returned one or more jobs;
-- `empty`: the source request succeeded and legitimately returned no jobs;
-- `failed`: a transient request, response, validation, or persistence error;
-- `invalid_configuration`: the ATS adapter is absent or the provider can
-  distinguish an unknown board identifier.
-
-Failed checks preserve the last successful time and job count.
-
-## Classify vacancies
-
-Classify every active normalized vacancy with the current `ios-v1` policy:
-
-```bash
-.venv/bin/job-search classify
-```
-
-The summary reports processed vacancies and counts for all three decisions.
-Classification identity is the composite primary key:
-
-```text
-(vacancy_id, classifier_version)
-```
-
-Running the command again updates that version's result instead of inserting a
-duplicate. A future ruleset can use `ios-v2` and coexist with historical `ios-v1`
-results for debugging and controlled reclassification.
-
-Inspect surviving vacancies:
-
-```bash
-.venv/bin/job-search candidates
-.venv/bin/job-search candidates --limit 20
-```
-
-Output includes decision, company, title, location, work mode, positive signals,
-warnings, and the application URL.
-
-### Decision semantics
-
-- `MATCH`: meaningful native iOS evidence, compatible seniority, and no material
-  eligibility uncertainty.
-- `POSSIBLE_MATCH`: native iOS relevance survives, but seniority, relocation,
-  geography, authorization, mixed-mobile scope, Lead scope, or legacy
-  Objective-C needs human review.
-- `REJECT`: explicit incompatibility such as Junior/Intern/Staff/Principal,
-  Android/Flutter/React-Native-only, no meaningful iOS evidence, primary
-  Objective-C, unsupported mandatory language, or explicit onsite/hybrid without
-  relocation.
-
-Title signals take precedence over incidental description mentions. For example,
-an Android title is not accepted merely because the description mentions
-collaboration with an iOS team. Generic Mobile titles require multiple native
-iOS/Swift signals in the description.
-
-## Idempotency and database identity
-
-Vacancies have independent internal UUIDs. A provider ID is stored only as
-`source_job_id`. Aggregated vacancies additionally store `employer_name`, while
-`company_id` continues to identify the configured collection source. The
-database enforces:
-
-```text
-UNIQUE(source, source_job_id)
-```
-
-When a known vacancy is observed again, mutable source-derived fields and
-`last_seen_at` are updated while internal `id` and `first_seen_at` are
-preserved. The unique database constraint protects against duplicates even if
-application logic regresses.
-
-## Quality commands
-
-```bash
-make format
-make lint
-make typecheck
-make test
-make quality
-```
-
-The direct equivalents are:
-
-```bash
-.venv/bin/ruff format .
-.venv/bin/ruff check .
-.venv/bin/ruff format --check .
-.venv/bin/mypy
-.venv/bin/pytest
-```
-
-The pre-existing Telegram scripts are excluded from Ruff and mypy because they
-predate the Phase 1 architecture. The complete existing classifier suite still
-runs under pytest, preventing regressions in legacy behavior.
-
-## Legacy Telegram collector
-
-The scheduled collector remains compatible:
+Set `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `TELEGRAM_PHONE` in `.env`, then
+use either a one-shot scan or continuous monitoring:
 
 ```bash
 .venv/bin/python main.py --once
-```
-
-Continuous mode remains:
-
-```bash
 .venv/bin/python main.py
 ```
 
-### macOS scheduling with launchd
+The collector keeps a local Telethon session and processing state, writes an
+audit log, and sends matches to Saved Messages. Those runtime artifacts are
+ignored and must not be committed.
+
+#### macOS scheduling
 
 [`launchd/local.job-scout.collector.plist`](launchd/local.job-scout.collector.plist)
-is a portable template for running the one-shot collector every six hours.
-Because `launchd` does not expand `~` or shell variables in plist paths, copy
-the template to `~/Library/LaunchAgents/` and replace every
-`__JOBSCOUT_PROJECT_DIR__` value in that copy with the absolute path to your
-checkout. Create the checkout's `logs/` directory before loading the job.
-
-Validate and load the adapted copy with:
+is a portable template for the one-shot collector. Copy it to
+`~/Library/LaunchAgents/`, replace every `__JOBSCOUT_PROJECT_DIR__` in the copy
+with the absolute path to your checkout, and create the checkout's `logs/`
+directory. The tracked schedule runs at 00:15, 06:15, 12:15, and 18:15.
 
 ```bash
 plutil -lint "$HOME/Library/LaunchAgents/local.job-scout.collector.plist"
@@ -464,54 +307,54 @@ launchctl bootstrap "gui/$(id -u)" \
   "$HOME/Library/LaunchAgents/local.job-scout.collector.plist"
 ```
 
-The tracked template is not read by an already installed LaunchAgent, so
-editing it does not modify or unload an existing local job.
+The tracked template is not read by an already installed LaunchAgent; changing
+the repository file does not unload or alter an installed local job.
 
-Phase 1 deliberately does not call or depend on this module.
+## Project Structure
 
-## Important design decisions
+```text
+src/job_search/
+  domain/                     Framework-independent models and iOS policy
+  application/                Ports, use cases, and result models
+  infrastructure/
+    sources/                  Six external-source adapters
+    persistence/sqlalchemy/   Async repository implementations
+    registry/                 Validated company-registry loader
+  presentation/               CLI composition root
+tests/                        Unit, integration, and regression tests
+migrations/                   Alembic revisions
+data/companies.json           Versioned source registry
+launchd/                      Portable macOS scheduling template
+main.py                       Separate legacy Telegram collector
+```
 
-- Domain dataclasses and enums are independent from database/API DTOs.
-- Pydantic v2 validates untrusted ATS, registry, and configuration boundaries.
-- Repositories own sessions and explicit transaction scopes.
-- No ORM record crosses the persistence boundary.
-- One malformed ATS job is logged and skipped; a malformed envelope or failed
-  request fails that company collection explicitly.
-- No automatic retries are implemented yet; permanent failures are not hidden.
-- Company location and vacancy work location are distinct fields.
-- Remote policy is intentionally limited to `unknown`, `remote`, `hybrid`, and
-  `onsite` in Phase 1.
-- Classification policy lives in the domain because it is deterministic business
-  policy over normalized vacancies and has no persistence, HTTP, ATS, or CLI
-  dependencies.
-- Classification evidence stores compact enum values, not duplicated vacancy
-  descriptions.
+## Current Limitations
 
-## Current limitations
+- Vacancy disappearance/closure is not reconciled across the general source
+  pipeline. hh.ru can map an explicitly archived detail response to `closed`,
+  but this is not a complete lifecycle system.
+- Greenhouse list responses do not provide a reliable publication timestamp,
+  so those records may have `published_at = NULL`.
+- hh.ru requires OAuth; its adapter is disabled in the default registry.
+- Remote, geography, language, and relocation decisions are conservative,
+  phrase-based signals for human review—not legal eligibility conclusions.
+- The current classifier targets iOS relevance only. Python, full-stack,
+  project-management, and vibe-coding filters exist in the separate Telegram
+  collector, not in the normalized core classifier.
+- Find Dream Offer and LinkedIn are not collected directly: the former exposes
+  an undocumented CAPTCHA-gated browser backend, while LinkedIn does not offer
+  a suitable public job-search API for this use case. See the
+  [source investigation](docs/phase-3b-source-investigation.md).
+- There is no API server, LLM analysis, learned ranking, contact enrichment, or
+  automatic application workflow.
 
-- Greenhouse does not provide a reliable published timestamp in its public list
-  response, so `published_at` is currently `NULL`.
-- Ashby's explicit public job ID is preferred; the stable final path component
-  of `jobUrl` is a compatibility fallback for older payloads.
-- AgileFluent is a rolling 24-hour feed. Older collected vacancies remain in the
-  database because generic vacancy-closing reconciliation is not implemented.
-- hh.ru requires a registered OAuth application and token. Without it,
-  `collect-external` reports `invalid_configuration` and performs no anonymous
-  workaround.
-- Find Dream Offer and LinkedIn direct discovery are investigated but not
-  supported for the reasons documented above.
-- Basic remote-policy detection is intentionally shallow.
-- Geographic and language detection is conservative and phrase-based; warnings
-  require human review and are not legal-eligibility conclusions.
-- The classifier optimizes for recall but only recognizes native iOS evidence
-  expressed by its documented deterministic vocabulary.
-- Registry identifiers must be re-verified if a company changes ATS.
-- Closing vacancies that disappear from a source is not implemented yet.
+## Roadmap
 
-## Later phases
-
-Future phases may add other ATS and job-board adapters, Telegram ingestion,
-advanced remote eligibility, OpenAI analysis, candidate-profile comparison,
-contact enrichment, cross-source deduplication, Saved Messages delivery,
-application feedback, and vacancy lifecycle tracking. None of those features
-are part of Phase 3A.
+1. Generalize source reliability with consistent retry and backoff semantics.
+2. Reconcile vacancy lifecycle and stale/closed records.
+3. Add a query layer for normalized vacancies and classifications.
+4. Harden the operational collection pipeline and observability.
+5. Expose reviewed query use cases through FastAPI.
+6. Define AI analysis contracts, fixtures, and an evaluation dataset.
+7. Add structured LLM analysis and ranking behind those evaluations.
+8. Unify delivery channels with the normalized pipeline.
