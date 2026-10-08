@@ -1,15 +1,111 @@
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 os.environ.setdefault("TELEGRAM_API_ID", "1")
 os.environ.setdefault("TELEGRAM_API_HASH", "test")
 
 import main
+
+
+class CollectorStatePersistenceTests(unittest.TestCase):
+    def assert_private_file(self, path: Path) -> None:
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_first_creation_is_private_with_permissive_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "collector_state.json"
+            previous_umask = os.umask(0o022)
+            try:
+                main.persist_state(state_path, {"123": 456})
+            finally:
+                os.umask(previous_umask)
+
+            self.assert_private_file(state_path)
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                {"123": 456},
+            )
+
+    def test_replacement_corrects_existing_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "collector_state.json"
+            state_path.write_text('{"123": 1}', encoding="utf-8")
+            state_path.chmod(0o644)
+
+            main.persist_state(state_path, {"123": 2})
+
+            self.assert_private_file(state_path)
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                {"123": 2},
+            )
+
+    def test_repeated_persistence_remains_private_and_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "collector_state.json"
+
+            for message_id in range(1, 4):
+                main.persist_state(state_path, {"123": message_id})
+                self.assert_private_file(state_path)
+
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                {"123": 3},
+            )
+
+    def test_atomic_replace_uses_private_complete_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "collector_state.json"
+            state_path.write_text('{"123": 1}', encoding="utf-8")
+            real_replace = os.replace
+
+            def inspect_then_replace(source: Path, destination: Path) -> None:
+                source_path = Path(source)
+                self.assertEqual(
+                    json.loads(state_path.read_text(encoding="utf-8")),
+                    {"123": 1},
+                )
+                self.assert_private_file(source_path)
+                self.assertEqual(
+                    json.loads(source_path.read_text(encoding="utf-8")),
+                    {"123": 2},
+                )
+                real_replace(source, destination)
+
+            with patch("main.os.replace", side_effect=inspect_then_replace) as replace:
+                main.persist_state(state_path, {"123": 2})
+
+            replace.assert_called_once()
+            self.assert_private_file(state_path)
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                {"123": 2},
+            )
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+
+    def test_replace_failure_preserves_previous_state_and_cleans_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "collector_state.json"
+            state_path.write_text('{"123": 1}', encoding="utf-8")
+
+            with (
+                patch("main.os.replace", side_effect=OSError("replace failed")),
+                self.assertRaisesRegex(OSError, "replace failed"),
+            ):
+                main.persist_state(state_path, {"123": 2})
+
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8")),
+                {"123": 1},
+            )
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
 
 class SmartClassifierTests(unittest.TestCase):

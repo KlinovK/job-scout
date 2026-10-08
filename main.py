@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -771,6 +772,30 @@ def load_state() -> dict[str, int]:
 state = load_state()
 
 
+def persist_state(path: Path, data: dict[str, int]) -> None:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            os.fchmod(temporary_file.fileno(), 0o600)
+            json.dump(data, temporary_file, indent=2, sort_keys=True)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def record_match(message, chat, result: MatchResult) -> None:
     payload = {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -821,18 +846,7 @@ async def update_last_processed(
 
         state[key] = message_id
 
-        temporary_file = STATE_FILE.with_suffix(".tmp")
-
-        temporary_file.write_text(
-            json.dumps(
-                state,
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-
-        temporary_file.replace(STATE_FILE)
+        persist_state(STATE_FILE, state)
 
 
 async def save_text_copy(message, chat) -> None:
