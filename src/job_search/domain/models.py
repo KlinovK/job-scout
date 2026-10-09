@@ -44,6 +44,7 @@ class Company:
     last_job_count: int | None = None
     last_status: SourceHealthStatus | None = None
     last_error_category: str | None = None
+    last_complete_snapshot_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -57,6 +58,7 @@ class Company:
         _require_utc(self.updated_at, "updated_at")
         _require_utc(self.source_verified_at, "source_verified_at")
         _require_utc(self.last_success_at, "last_success_at")
+        _require_utc(self.last_complete_snapshot_at, "last_complete_snapshot_at")
         if self.last_job_count is not None and self.last_job_count < 0:
             raise ValueError("last_job_count must not be negative")
 
@@ -83,6 +85,7 @@ class JobVacancy:
     salary: str | None = None
     employment: str | None = None
     experience: str | None = None
+    closed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.title.strip():
@@ -104,6 +107,7 @@ class JobVacancy:
         _require_utc(self.published_at, "published_at")
         _require_utc(self.first_seen_at, "first_seen_at")
         _require_utc(self.last_seen_at, "last_seen_at")
+        _require_utc(self.closed_at, "closed_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +125,10 @@ class VacancyObservation:
     work_location: str | None
     first_seen_at: datetime
     last_seen_at: datetime
+    source_company_id: UUID | None = None
+    status: VacancyStatus = VacancyStatus.ACTIVE
+    closed_at: datetime | None = None
+    missing_complete_snapshots: int = 0
 
     def __post_init__(self) -> None:
         if not self.source_job_id.strip():
@@ -131,3 +139,6 @@ class VacancyObservation:
             raise ValueError("title must not be empty")
         _require_utc(self.first_seen_at, "first_seen_at")
         _require_utc(self.last_seen_at, "last_seen_at")
+        _require_utc(self.closed_at, "closed_at")
+        if self.missing_complete_snapshots < 0:
+            raise ValueError("missing_complete_snapshots must not be negative")

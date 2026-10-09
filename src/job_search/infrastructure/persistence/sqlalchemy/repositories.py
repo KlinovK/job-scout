@@ -75,6 +75,7 @@ def _company_to_record(company: Company) -> CompanyRecord:
         last_job_count=company.last_job_count,
         last_status=company.last_status.value if company.last_status else None,
         last_error_category=company.last_error_category,
+        last_complete_snapshot_at=company.last_complete_snapshot_at,
     )
 
 
@@ -99,6 +100,7 @@ def _company_to_domain(record: CompanyRecord) -> Company:
             SourceHealthStatus(record.last_status) if record.last_status else None
         ),
         last_error_category=record.last_error_category,
+        last_complete_snapshot_at=record.last_complete_snapshot_at,
     )
 
 
@@ -125,6 +127,7 @@ def _vacancy_to_record(vacancy: JobVacancy) -> JobVacancyRecord:
         first_seen_at=vacancy.first_seen_at,
         last_seen_at=vacancy.last_seen_at,
         status=vacancy.status.value,
+        closed_at=vacancy.closed_at,
     )
 
 
@@ -152,6 +155,7 @@ def _vacancy_to_domain(record: JobVacancyRecord) -> JobVacancy:
         salary=record.salary,
         employment=record.employment,
         experience=record.experience,
+        closed_at=record.closed_at,
     )
 
 
@@ -172,6 +176,12 @@ def _observation_to_domain(record: VacancyObservationRecord) -> VacancyObservati
         work_location=record.work_location,
         first_seen_at=record.first_seen_at,
         last_seen_at=record.last_seen_at,
+        source_company_id=(
+            UUID(record.source_company_id) if record.source_company_id else None
+        ),
+        status=VacancyStatus(record.status),
+        closed_at=record.closed_at,
+        missing_complete_snapshots=record.missing_complete_snapshots,
     )
 
 
@@ -180,10 +190,11 @@ def _new_observation(
     canonical_vacancy_id: str,
     canonical_url: str,
 ) -> VacancyObservationRecord:
-    identity = f"{vacancy.source.value}:{vacancy.source_job_id}"
+    identity = f"{vacancy.company_id}:{vacancy.source.value}:{vacancy.source_job_id}"
     return VacancyObservationRecord(
         id=str(uuid5(NAMESPACE_URL, f"vacancy-observation:{identity}")),
         vacancy_id=canonical_vacancy_id,
+        source_company_id=str(vacancy.company_id),
         discovered_via=vacancy.source.value,
         source_job_id=vacancy.source_job_id,
         original_source=(vacancy.original_source or vacancy.source).value,
@@ -195,6 +206,9 @@ def _new_observation(
         work_location=vacancy.work_location,
         first_seen_at=vacancy.first_seen_at,
         last_seen_at=vacancy.last_seen_at,
+        status=vacancy.status.value,
+        closed_at=vacancy.closed_at,
+        missing_complete_snapshots=0,
     )
 
 
@@ -221,6 +235,7 @@ def _update_canonical_record(
     record.published_at = vacancy.published_at
     record.last_seen_at = vacancy.last_seen_at
     record.status = vacancy.status.value
+    record.closed_at = vacancy.closed_at
 
 
 def _classification_to_record(
@@ -386,6 +401,7 @@ class SQLAlchemyVacancyRepository:
 
     async def get_by_source_identity(
         self,
+        source_company_id: UUID,
         source: VacancySource,
         source_job_id: str,
     ) -> JobVacancy | None:
@@ -399,6 +415,8 @@ class SQLAlchemyVacancyRepository:
                 .where(
                     VacancyObservationRecord.discovered_via == source.value,
                     VacancyObservationRecord.source_job_id == source_job_id,
+                    VacancyObservationRecord.source_company_id
+                    == str(source_company_id),
                 )
             )
             record = await session.scalar(statement)
@@ -418,6 +436,8 @@ class SQLAlchemyVacancyRepository:
                     vacancy.url
                 )
                 source_statement = select(VacancyObservationRecord).where(
+                    VacancyObservationRecord.source_company_id
+                    == str(vacancy.company_id),
                     VacancyObservationRecord.discovered_via == vacancy.source.value,
                     VacancyObservationRecord.source_job_id == vacancy.source_job_id,
                 )
@@ -443,6 +463,8 @@ class SQLAlchemyVacancyRepository:
                     observation.title = vacancy.title
                     observation.work_location = vacancy.work_location
                     observation.last_seen_at = vacancy.last_seen_at
+                    observation.status = vacancy.status.value
+                    observation.closed_at = vacancy.closed_at
                     if (
                         record.source == vacancy.source.value
                         and record.source_job_id == vacancy.source_job_id

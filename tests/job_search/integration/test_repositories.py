@@ -8,7 +8,12 @@ from sqlalchemy.exc import IntegrityError
 
 from job_search.application.models import SourceHealthUpdate
 from job_search.application.services import SeedCompaniesService
-from job_search.domain.enums import ATSType, SourceHealthStatus, VacancySource
+from job_search.domain.enums import (
+    ATSType,
+    SourceHealthStatus,
+    VacancySource,
+    VacancyStatus,
+)
 from job_search.infrastructure.persistence.sqlalchemy.models import JobVacancyRecord
 from job_search.infrastructure.persistence.sqlalchemy.repositories import (
     SQLAlchemyCompanyRepository,
@@ -115,6 +120,7 @@ async def test_vacancy_create_retrieve_and_update_preserves_identity(database) -
     )
     second_result = await vacancies.upsert_many([updated_input])
     stored = await vacancies.get_by_source_identity(
+        company.id,
         VacancySource.GREENHOUSE,
         original.source_job_id,
     )
@@ -258,6 +264,54 @@ async def test_database_enforces_source_identity_uniqueness(database) -> None:
         )
         with pytest.raises(IntegrityError):
             await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_source_identity_and_observation_ownership_are_company_scoped(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    company_a = make_company(name="Company A", ats_identifier="company-a")
+    company_b = make_company(name="Company B", ats_identifier="company-b")
+    await companies.add(company_a)
+    await companies.add(company_b)
+    vacancy_a = make_vacancy(
+        company_a.id,
+        source_job_id="tenant-local-id",
+        url="https://a.example/jobs/tenant-local-id",
+    )
+    vacancy_b = make_vacancy(
+        company_b.id,
+        source_job_id="tenant-local-id",
+        url="https://b.example/jobs/tenant-local-id",
+    )
+
+    first = await vacancies.upsert_many([vacancy_a])
+    second = await vacancies.upsert_many([vacancy_b])
+    stored_a = await vacancies.get_by_source_identity(
+        company_a.id,
+        VacancySource.GREENHOUSE,
+        "tenant-local-id",
+    )
+    stored_b = await vacancies.get_by_source_identity(
+        company_b.id,
+        VacancySource.GREENHOUSE,
+        "tenant-local-id",
+    )
+    observations_a = await vacancies.list_observations(vacancy_a.id)
+    observations_b = await vacancies.list_observations(vacancy_b.id)
+
+    assert first.created == 1
+    assert second.created == 1
+    assert stored_a is not None and stored_a.id == vacancy_a.id
+    assert stored_b is not None and stored_b.id == vacancy_b.id
+    assert observations_a[0].source_company_id == company_a.id
+    assert observations_b[0].source_company_id == company_b.id
+    assert observations_a[0].status is VacancyStatus.ACTIVE
+    assert observations_a[0].closed_at is None
+    assert observations_a[0].missing_complete_snapshots == 0
 
 
 @pytest.mark.asyncio

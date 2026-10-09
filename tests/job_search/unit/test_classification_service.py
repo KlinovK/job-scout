@@ -24,10 +24,11 @@ class FakeVacancies:
 
     async def get_by_source_identity(
         self,
+        source_company_id: UUID,
         source: VacancySource,
         source_job_id: str,
     ) -> JobVacancy | None:
-        del source, source_job_id
+        del source_company_id, source, source_job_id
         return None
 
     async def upsert_many(

@@ -50,6 +50,7 @@ class VacancyRepository(Protocol):
 
     async def get_by_source_identity(
         self,
+        source_company_id: UUID,
         source: VacancySource,
         source_job_id: str,
     ) -> JobVacancy | None: ...

@@ -9,6 +9,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -45,6 +46,7 @@ class CompanyRecord(Base):
     last_job_count: Mapped[int | None] = mapped_column(Integer)
     last_status: Mapped[str | None] = mapped_column(String(32))
     last_error_category: Mapped[str | None] = mapped_column(String(120))
+    last_complete_snapshot_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     vacancies: Mapped[list["JobVacancyRecord"]] = relationship(
         back_populates="company",
@@ -56,9 +58,10 @@ class JobVacancyRecord(Base):
     __tablename__ = "job_vacancies"
     __table_args__ = (
         UniqueConstraint(
+            "company_id",
             "source",
             "source_job_id",
-            name="uq_job_vacancies_source_identity",
+            name="uq_job_vacancies_company_source_identity",
         ),
         CheckConstraint(
             "remote_policy IN ('unknown', 'remote', 'hybrid', 'onsite')",
@@ -70,6 +73,7 @@ class JobVacancyRecord(Base):
         ),
         Index("ix_job_vacancies_company_id", "company_id"),
         Index("ix_job_vacancies_canonical_url", "canonical_url"),
+        Index("ix_job_vacancies_status", "status"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -96,6 +100,7 @@ class JobVacancyRecord(Base):
     first_seen_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     company: Mapped[CompanyRecord] = relationship(back_populates="vacancies")
 
@@ -103,14 +108,38 @@ class JobVacancyRecord(Base):
 class VacancyObservationRecord(Base):
     __tablename__ = "vacancy_observations"
     __table_args__ = (
-        UniqueConstraint(
+        CheckConstraint(
+            "status IN ('active', 'closed')",
+            name="ck_vacancy_observations_status",
+        ),
+        CheckConstraint(
+            "missing_complete_snapshots >= 0",
+            name="ck_vacancy_observations_missing_nonnegative",
+        ),
+        Index(
+            "uq_vacancy_observations_owned_source_identity",
+            "source_company_id",
             "discovered_via",
             "source_job_id",
-            name="uq_vacancy_observations_source_identity",
+            unique=True,
+            sqlite_where=text("source_company_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_vacancy_observations_unowned_source_identity",
+            "discovered_via",
+            "source_job_id",
+            unique=True,
+            sqlite_where=text("source_company_id IS NULL"),
         ),
         Index("ix_vacancy_observations_vacancy_id", "vacancy_id"),
         Index("ix_vacancy_observations_canonical_url", "canonical_url"),
         Index("ix_vacancy_observations_original_reference", "original_reference"),
+        Index(
+            "ix_vacancy_observations_company_reconciliation",
+            "source_company_id",
+            "discovered_via",
+            "status",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -118,6 +147,10 @@ class VacancyObservationRecord(Base):
         String(36),
         ForeignKey("job_vacancies.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    source_company_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("companies.id", ondelete="SET NULL"),
     )
     discovered_via: Mapped[str] = mapped_column(String(32), nullable=False)
     source_job_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -130,6 +163,17 @@ class VacancyObservationRecord(Base):
     work_location: Mapped[str | None] = mapped_column(String(500))
     first_seen_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="active",
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    missing_complete_snapshots: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
 
 
 class VacancyClassificationRecord(Base):

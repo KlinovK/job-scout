@@ -77,9 +77,11 @@ class FakeVacancyRepository:
 
     async def get_by_source_identity(
         self,
+        source_company_id: UUID,
         source: VacancySource,
         source_job_id: str,
     ) -> JobVacancy | None:
+        del source_company_id
         return self.items.get((source, source_job_id))
 
     async def upsert_many(
