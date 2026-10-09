@@ -12,6 +12,10 @@ from job_search.application.errors import (
     InvalidSourceConfigurationError,
     JobSourceError,
 )
+from job_search.application.models import (
+    CollectionCoverage,
+    SourceCollectionResult,
+)
 from job_search.domain.enums import RemotePolicy, VacancySource, VacancyStatus
 from job_search.domain.models import Company, JobVacancy
 from job_search.infrastructure.sources.agilefluent.dto import (
@@ -143,7 +147,7 @@ class AgileFluentSource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         if company.ats_identifier != self._IDENTIFIER:
             raise InvalidSourceConfigurationError(
                 f"Unknown AgileFluent source identifier for {company.name}"
@@ -191,7 +195,14 @@ class AgileFluentSource:
             raise AgileFluentSourceError(
                 f"All {raw_count} AgileFluent jobs were malformed for {company.name}"
             )
-        return tuple(vacancies)
+        return SourceCollectionResult(
+            vacancies=tuple(vacancies),
+            coverage=CollectionCoverage.ROLLING_WINDOW,
+            complete=malformed_count == 0,
+            raw_count=raw_count,
+            malformed_count=malformed_count,
+            pagination_exhausted=True,
+        )
 
     async def _fetch_page(
         self,

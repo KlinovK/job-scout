@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from job_search.application.errors import InvalidSourceConfigurationError
+from job_search.application.models import CollectionCoverage
 from job_search.domain.enums import ATSType, RemotePolicy, VacancySource
 from job_search.infrastructure.http import RetryPolicy
 from job_search.infrastructure.sources.recruitee import (
@@ -73,10 +74,14 @@ async def _collect(response: httpx.Response):
 
 @pytest.mark.asyncio
 async def test_successful_response_is_normalized() -> None:
-    vacancies = await _collect(httpx.Response(200, json={"offers": [_offer(42)]}))
+    result = await _collect(httpx.Response(200, json={"offers": [_offer(42)]}))
 
-    assert len(vacancies) == 1
-    vacancy = vacancies[0]
+    assert result.coverage is CollectionCoverage.FULL_BOARD
+    assert result.complete is True
+    assert result.pagination_exhausted is True
+    assert result.reconciliation_eligible is True
+    assert len(result.vacancies) == 1
+    vacancy = result.vacancies[0]
     assert vacancy.source is VacancySource.RECRUITEE
     assert vacancy.source_job_id == "42"
     assert vacancy.description == "Build products with Swift. Experience with UIKit."
@@ -88,12 +93,15 @@ async def test_successful_response_is_normalized() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_response_is_empty() -> None:
-    assert await _collect(httpx.Response(200, json={"offers": []})) == ()
+    result = await _collect(httpx.Response(200, json={"offers": []}))
+
+    assert result.vacancies == ()
+    assert result.reconciliation_eligible is True
 
 
 @pytest.mark.asyncio
 async def test_remote_policy_variants() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(
             200,
             json={
@@ -106,7 +114,7 @@ async def test_remote_policy_variants() -> None:
         )
     )
 
-    assert [item.remote_policy for item in vacancies] == [
+    assert [item.remote_policy for item in result.vacancies] == [
         RemotePolicy.HYBRID,
         RemotePolicy.ONSITE,
         RemotePolicy.UNKNOWN,
@@ -115,14 +123,14 @@ async def test_remote_policy_variants() -> None:
 
 @pytest.mark.asyncio
 async def test_null_requirements_are_supported() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(
             200,
             json={"offers": [_offer(42, requirements=None)]},
         )
     )
 
-    assert vacancies[0].description == "Build products with Swift."
+    assert result.vacancies[0].description == "Build products with Swift."
 
 
 @pytest.mark.asyncio
@@ -139,14 +147,18 @@ async def test_http_failure_has_company_context() -> None:
 
 @pytest.mark.asyncio
 async def test_malformed_offer_is_skipped() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(
             200,
             json={"offers": [{"title": "Broken"}, _offer(42)]},
         )
     )
 
-    assert [item.source_job_id for item in vacancies] == ["42"]
+    assert [item.source_job_id for item in result.vacancies] == ["42"]
+    assert result.raw_count == 2
+    assert result.malformed_count == 1
+    assert result.complete is False
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio

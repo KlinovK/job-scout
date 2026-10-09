@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import re
-from collections.abc import Sequence
 from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
@@ -14,6 +13,10 @@ from pydantic import ValidationError
 from job_search.application.errors import (
     InvalidSourceConfigurationError,
     JobSourceError,
+)
+from job_search.application.models import (
+    CollectionCoverage,
+    SourceCollectionResult,
 )
 from job_search.domain.enums import RemotePolicy, VacancySource, VacancyStatus
 from job_search.domain.models import Company, JobVacancy
@@ -90,7 +93,7 @@ class GreenhouseSource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         identifier = quote(company.ats_identifier, safe="")
         url = f"{self._BASE_URL}/{identifier}/jobs"
 
@@ -191,4 +194,14 @@ class GreenhouseSource:
                 f"All {raw_count} Greenhouse jobs were malformed for {company.name}"
             )
 
-        return tuple(vacancies)
+        reported_total = envelope.meta.total if envelope.meta is not None else None
+        pagination_exhausted = reported_total == raw_count
+        complete = pagination_exhausted and malformed_count == 0
+        return SourceCollectionResult(
+            vacancies=tuple(vacancies),
+            coverage=CollectionCoverage.FULL_BOARD,
+            complete=complete,
+            raw_count=raw_count,
+            malformed_count=malformed_count,
+            pagination_exhausted=pagination_exhausted,
+        )

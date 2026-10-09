@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from job_search.application.errors import InvalidSourceConfigurationError
+from job_search.application.models import CollectionCoverage
 from job_search.domain.enums import RemotePolicy
 from job_search.infrastructure.http import RetryPolicy
 from job_search.infrastructure.sources.greenhouse import (
@@ -39,10 +40,18 @@ async def _collect(response: httpx.Response):
 
 @pytest.mark.asyncio
 async def test_successful_response_is_normalized() -> None:
-    vacancies = await _collect(httpx.Response(200, json={"jobs": [_job(42)]}))
+    result = await _collect(
+        httpx.Response(200, json={"jobs": [_job(42)], "meta": {"total": 1}})
+    )
 
-    assert len(vacancies) == 1
-    vacancy = vacancies[0]
+    assert result.coverage is CollectionCoverage.FULL_BOARD
+    assert result.complete is True
+    assert result.raw_count == 1
+    assert result.malformed_count == 0
+    assert result.pagination_exhausted is True
+    assert result.reconciliation_eligible is True
+    assert len(result.vacancies) == 1
+    vacancy = result.vacancies[0]
     assert vacancy.source_job_id == "42"
     assert vacancy.title == "iOS Engineer"
     assert vacancy.description == "Build products with\nSwift\n."
@@ -57,20 +66,40 @@ async def test_html_escaped_description_is_normalized() -> None:
     job = _job(43)
     job["content"] = "&lt;p&gt;Build with Swift &amp;amp; UIKit.&lt;/p&gt;"
 
-    vacancies = await _collect(httpx.Response(200, json={"jobs": [job]}))
+    result = await _collect(httpx.Response(200, json={"jobs": [job]}))
 
-    assert vacancies[0].description == "Build with Swift & UIKit."
+    assert result.vacancies[0].description == "Build with Swift & UIKit."
 
 
 @pytest.mark.asyncio
 async def test_multiple_and_empty_responses() -> None:
     multiple = await _collect(
-        httpx.Response(200, json={"jobs": [_job(1), _job(2, "Swift Engineer")]})
+        httpx.Response(
+            200,
+            json={
+                "jobs": [_job(1), _job(2, "Swift Engineer")],
+                "meta": {"total": 2},
+            },
+        )
     )
-    empty = await _collect(httpx.Response(200, json={"jobs": []}))
+    empty = await _collect(httpx.Response(200, json={"jobs": [], "meta": {"total": 0}}))
 
-    assert [vacancy.source_job_id for vacancy in multiple] == ["1", "2"]
-    assert empty == ()
+    assert [vacancy.source_job_id for vacancy in multiple.vacancies] == ["1", "2"]
+    assert empty.vacancies == ()
+    assert empty.reconciliation_eligible is True
+
+
+@pytest.mark.asyncio
+async def test_missing_or_mismatched_total_is_conservatively_incomplete() -> None:
+    missing = await _collect(httpx.Response(200, json={"jobs": [_job(1)]}))
+    mismatched = await _collect(
+        httpx.Response(200, json={"jobs": [_job(1)], "meta": {"total": 2}})
+    )
+
+    assert missing.complete is False
+    assert missing.pagination_exhausted is False
+    assert mismatched.complete is False
+    assert mismatched.pagination_exhausted is False
 
 
 @pytest.mark.asyncio
@@ -113,11 +142,11 @@ async def test_transient_status_is_retried_by_source() -> None:
         delays.append(delay)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        vacancies = await GreenhouseSource(client, sleep=sleep).collect(
+        result = await GreenhouseSource(client, sleep=sleep).collect(
             make_company(), OBSERVED_AT
         )
 
-    assert [item.source_job_id for item in vacancies] == ["42"]
+    assert [item.source_job_id for item in result.vacancies] == ["42"]
     assert attempts == 2
     assert delays == [0.5]
 
@@ -222,15 +251,21 @@ async def test_malformed_response_is_rejected(response: httpx.Response) -> None:
 
 @pytest.mark.asyncio
 async def test_malformed_individual_job_is_skipped() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(
             200,
-            json={"jobs": [{"id": "not-an-integer"}, _job(2)]},
+            json={
+                "jobs": [{"id": "not-an-integer"}, _job(2)],
+                "meta": {"total": 2},
+            },
         )
     )
 
-    assert len(vacancies) == 1
-    assert vacancies[0].source_job_id == "2"
+    assert [item.source_job_id for item in result.vacancies] == ["2"]
+    assert result.raw_count == 2
+    assert result.malformed_count == 1
+    assert result.complete is False
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio
@@ -264,11 +299,11 @@ async def test_basic_remote_policy_variants() -> None:
     unknown = _job(3)
     unknown["location"] = {"name": "Athens"}
 
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(200, json={"jobs": [hybrid, onsite, unknown]})
     )
 
-    assert [item.remote_policy for item in vacancies] == [
+    assert [item.remote_policy for item in result.vacancies] == [
         RemotePolicy.HYBRID,
         RemotePolicy.ONSITE,
         RemotePolicy.UNKNOWN,

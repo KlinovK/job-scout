@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from job_search.application.errors import InvalidSourceConfigurationError
+from job_search.application.models import CollectionCoverage
 from job_search.domain.enums import ATSType, RemotePolicy, VacancySource
 from job_search.infrastructure.sources.agilefluent import (
     AgileFluentSearchProfile,
@@ -71,12 +72,16 @@ async def _collect(response: httpx.Response):
 
 @pytest.mark.asyncio
 async def test_successful_response_is_normalized() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(200, json={"data": [_job("26939349")], "hasMore": False})
     )
 
-    assert len(vacancies) == 1
-    vacancy = vacancies[0]
+    assert result.coverage is CollectionCoverage.ROLLING_WINDOW
+    assert result.complete is True
+    assert result.pagination_exhausted is True
+    assert result.reconciliation_eligible is False
+    assert len(result.vacancies) == 1
+    vacancy = result.vacancies[0]
     assert vacancy.source is VacancySource.AGILEFLUENT
     assert vacancy.source_job_id == "26939349"
     assert vacancy.employer_name == "Example Employer"
@@ -90,9 +95,11 @@ async def test_successful_response_is_normalized() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_response_is_empty() -> None:
-    vacancies = await _collect(httpx.Response(200, json={"data": [], "hasMore": False}))
+    result = await _collect(httpx.Response(200, json={"data": [], "hasMore": False}))
 
-    assert vacancies == ()
+    assert result.vacancies == ()
+    assert result.complete is True
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio
@@ -114,26 +121,30 @@ async def test_pagination_and_cross_page_deduplication() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        vacancies = await AgileFluentSource(
+        result = await AgileFluentSource(
             client,
             profiles=(PROFILE,),
             page_size=1,
         ).collect(_company(), OBSERVED_AT)
 
     assert requests == [1, 2]
-    assert [item.source_job_id for item in vacancies] == ["one", "two"]
+    assert [item.source_job_id for item in result.vacancies] == ["one", "two"]
+    assert result.pagination_exhausted is True
 
 
 @pytest.mark.asyncio
 async def test_malformed_individual_job_is_skipped() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(
             200,
             json={"data": [{"id": "broken"}, _job("valid")], "hasMore": False},
         )
     )
 
-    assert [item.source_job_id for item in vacancies] == ["valid"]
+    assert [item.source_job_id for item in result.vacancies] == ["valid"]
+    assert result.malformed_count == 1
+    assert result.complete is False
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio
@@ -171,13 +182,15 @@ async def test_malformed_page_then_filtered_page_produces_successful_empty() -> 
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        vacancies = await AgileFluentSource(
+        result = await AgileFluentSource(
             client,
             profiles=(PROFILE,),
         ).collect(_company(), OBSERVED_AT)
 
     assert pages == [1, 2]
-    assert vacancies == ()
+    assert result.vacancies == ()
+    assert result.malformed_count == 1
+    assert result.complete is False
 
 
 @pytest.mark.asyncio
@@ -197,8 +210,10 @@ async def test_server_grade_mismatch_is_filtered_locally() -> None:
         )
     )
 
-    assert filtered_only == ()
-    assert [item.source_job_id for item in mixed] == ["senior"]
+    assert filtered_only.vacancies == ()
+    assert filtered_only.complete is True
+    assert filtered_only.reconciliation_eligible is False
+    assert [item.source_job_id for item in mixed.vacancies] == ["senior"]
 
 
 @pytest.mark.asyncio
@@ -272,9 +287,9 @@ async def test_remote_policy_variants() -> None:
             "hasMore": False,
         },
     )
-    vacancies = await _collect(response)
+    result = await _collect(response)
 
-    assert [item.remote_policy for item in vacancies] == [
+    assert [item.remote_policy for item in result.vacancies] == [
         RemotePolicy.REMOTE,
         RemotePolicy.HYBRID,
         RemotePolicy.ONSITE,

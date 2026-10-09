@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from job_search.application.errors import InvalidSourceConfigurationError
+from job_search.application.models import CollectionCoverage
 from job_search.domain.enums import ATSType, RemotePolicy, VacancySource
 from job_search.infrastructure.http import RetryPolicy
 from job_search.infrastructure.sources.ashby import AshbySource, AshbySourceError
@@ -53,12 +54,16 @@ async def _collect(response: httpx.Response):
 
 @pytest.mark.asyncio
 async def test_successful_response_is_normalized() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(200, json={"apiVersion": "1", "jobs": [_job("job-42")]})
     )
 
-    assert len(vacancies) == 1
-    vacancy = vacancies[0]
+    assert result.coverage is CollectionCoverage.FULL_BOARD
+    assert result.complete is True
+    assert result.pagination_exhausted is True
+    assert result.reconciliation_eligible is True
+    assert len(result.vacancies) == 1
+    vacancy = result.vacancies[0]
     assert vacancy.source is VacancySource.ASHBY
     assert vacancy.source_job_id == "job-42"
     assert vacancy.remote_policy is RemotePolicy.REMOTE
@@ -88,14 +93,20 @@ async def test_multiple_empty_and_unlisted_responses() -> None:
         )
     )
 
-    assert [item.source_job_id for item in multiple] == ["one", "two"]
-    assert empty == ()
-    assert unlisted_only == ()
+    assert [item.source_job_id for item in multiple.vacancies] == ["one", "two"]
+    assert multiple.raw_count == 3
+    assert multiple.complete is True
+    assert multiple.reconciliation_eligible is True
+    assert empty.vacancies == ()
+    assert empty.reconciliation_eligible is True
+    assert unlisted_only.vacancies == ()
+    assert unlisted_only.raw_count == 1
+    assert unlisted_only.reconciliation_eligible is True
 
 
 @pytest.mark.asyncio
 async def test_explicit_id_is_preferred_and_null_remote_is_supported() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(
             200,
             json={
@@ -105,8 +116,8 @@ async def test_explicit_id_is_preferred_and_null_remote_is_supported() -> None:
         )
     )
 
-    assert vacancies[0].source_job_id == "explicit-url-id"
-    assert vacancies[0].remote_policy is RemotePolicy.REMOTE
+    assert result.vacancies[0].source_job_id == "explicit-url-id"
+    assert result.vacancies[0].remote_policy is RemotePolicy.REMOTE
 
 
 @pytest.mark.asyncio
@@ -151,14 +162,17 @@ async def test_malformed_response_is_rejected(response: httpx.Response) -> None:
 
 @pytest.mark.asyncio
 async def test_malformed_individual_job_is_skipped() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(
             200,
             json={"apiVersion": "1", "jobs": [{"title": "Broken"}, _job("valid")]},
         )
     )
 
-    assert [item.source_job_id for item in vacancies] == ["valid"]
+    assert [item.source_job_id for item in result.vacancies] == ["valid"]
+    assert result.malformed_count == 1
+    assert result.complete is False
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio
@@ -177,7 +191,7 @@ async def test_all_malformed_jobs_fail_the_source() -> None:
 
 @pytest.mark.asyncio
 async def test_malformed_and_unlisted_jobs_produce_successful_empty() -> None:
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(
             200,
             json={
@@ -190,7 +204,11 @@ async def test_malformed_and_unlisted_jobs_produce_successful_empty() -> None:
         )
     )
 
-    assert vacancies == ()
+    assert result.vacancies == ()
+    assert result.raw_count == 2
+    assert result.malformed_count == 1
+    assert result.complete is False
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio
@@ -198,14 +216,14 @@ async def test_remote_policy_variants() -> None:
     hybrid = _job("hybrid", workplace_type="Hybrid", is_remote=False)
     onsite = _job("onsite", workplace_type="OnSite", is_remote=False)
     unknown = _job("unknown", workplace_type="Office", is_remote=False)
-    vacancies = await _collect(
+    result = await _collect(
         httpx.Response(
             200,
             json={"apiVersion": "1", "jobs": [hybrid, onsite, unknown]},
         )
     )
 
-    assert [item.remote_policy for item in vacancies] == [
+    assert [item.remote_policy for item in result.vacancies] == [
         RemotePolicy.HYBRID,
         RemotePolicy.ONSITE,
         RemotePolicy.UNKNOWN,

@@ -13,6 +13,10 @@ from job_search.application.errors import (
     InvalidSourceConfigurationError,
     JobSourceError,
 )
+from job_search.application.models import (
+    CollectionCoverage,
+    SourceCollectionResult,
+)
 from job_search.domain.canonicalization import normalize_canonical_url
 from job_search.domain.enums import RemotePolicy, VacancySource, VacancyStatus
 from job_search.domain.models import Company, JobVacancy
@@ -111,7 +115,7 @@ class HHSource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         if company.ats_identifier != "api.hh.ru":
             raise InvalidSourceConfigurationError(
                 f"Unknown hh.ru source identifier for {company.name}"
@@ -123,7 +127,7 @@ class HHSource:
             )
 
         published_from = observed_at - timedelta(hours=self._max_age_hours)
-        vacancy_ids = await self._search_ids(published_from)
+        vacancy_ids, pagination_exhausted = await self._search_ids(published_from)
         details, malformed_count = await self._fetch_details(vacancy_ids)
         raw_count = len(vacancy_ids)
         vacancies: list[JobVacancy] = []
@@ -197,10 +201,21 @@ class HHSource:
                 f"All {raw_count} hh.ru vacancy responses were malformed "
                 f"for {company.name}"
             )
-        return tuple(vacancies)
+        return SourceCollectionResult(
+            vacancies=tuple(vacancies),
+            coverage=CollectionCoverage.ROLLING_WINDOW,
+            complete=pagination_exhausted and malformed_count == 0,
+            raw_count=raw_count,
+            malformed_count=malformed_count,
+            pagination_exhausted=pagination_exhausted,
+        )
 
-    async def _search_ids(self, published_from: datetime) -> tuple[str, ...]:
+    async def _search_ids(
+        self,
+        published_from: datetime,
+    ) -> tuple[tuple[str, ...], bool]:
         found: dict[str, None] = {}
+        pagination_exhausted = True
         for term in _SEARCH_TERMS:
             for page in range(self._max_pages_per_query):
                 payload = await self._get_json(
@@ -223,11 +238,12 @@ class HHSource:
                 if page + 1 >= envelope.pages or not envelope.items:
                     break
             else:
+                pagination_exhausted = False
                 self._logger.warning(
                     "hh.ru pagination reached safety limit",
                     extra={"term": term, "max_pages": self._max_pages_per_query},
                 )
-        return tuple(found)
+        return tuple(found), pagination_exhausted
 
     async def _fetch_details(
         self,

@@ -8,7 +8,13 @@ from job_search.application.errors import (
     InvalidSourceConfigurationError,
     JobSourceError,
 )
-from job_search.domain.enums import ATSType, RemotePolicy, VacancySource
+from job_search.application.models import CollectionCoverage
+from job_search.domain.enums import (
+    ATSType,
+    RemotePolicy,
+    VacancySource,
+    VacancyStatus,
+)
 from job_search.infrastructure.sources.hh import HHSource, HHSourceError
 from tests.job_search.factories import make_company
 
@@ -68,14 +74,18 @@ async def test_hh_normalizes_full_vacancy_and_deduplicates_queries() -> None:
         return httpx.Response(200, json=_detail())
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        vacancies = await HHSource(client, oauth_token="token", max_retries=0).collect(
+        result = await HHSource(client, oauth_token="token", max_retries=0).collect(
             _company(), OBSERVED_AT
         )
 
     assert requests.count("/vacancies") == 4
     assert requests.count("/vacancies/123") == 1
-    assert len(vacancies) == 1
-    vacancy = vacancies[0]
+    assert result.coverage is CollectionCoverage.ROLLING_WINDOW
+    assert result.complete is True
+    assert result.pagination_exhausted is True
+    assert result.reconciliation_eligible is False
+    assert len(result.vacancies) == 1
+    vacancy = result.vacancies[0]
     assert vacancy.source is VacancySource.HH
     assert vacancy.original_source is VacancySource.HH
     assert vacancy.employer_name == "Example Employer"
@@ -92,13 +102,15 @@ async def test_hh_empty_search_is_empty() -> None:
         return httpx.Response(200, json=_search([]))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        vacancies = await HHSource(
+        result = await HHSource(
             client,
             oauth_token="token",
             max_retries=0,
         ).collect(_company(), OBSERVED_AT)
 
-    assert vacancies == ()
+    assert result.vacancies == ()
+    assert result.complete is True
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio
@@ -118,12 +130,54 @@ async def test_hh_paginates_and_stops_at_provider_page_count() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        vacancies = await HHSource(client, oauth_token="token", max_retries=0).collect(
+        result = await HHSource(client, oauth_token="token", max_retries=0).collect(
             _company(), OBSERVED_AT
         )
 
     assert pages == [0, 1] * 4
-    assert {item.source_job_id for item in vacancies} == {"1", "2"}
+    assert {item.source_job_id for item in result.vacancies} == {"1", "2"}
+    assert result.pagination_exhausted is True
+
+
+@pytest.mark.asyncio
+async def test_hh_page_cap_is_explicitly_incomplete() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/vacancies/"):
+            return httpx.Response(
+                200, json=_detail(request.url.path.rsplit("/", 1)[-1])
+            )
+        return httpx.Response(200, json=_search(["123"], pages=2))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await HHSource(
+            client,
+            oauth_token="token",
+            max_pages_per_query=1,
+            max_retries=0,
+        ).collect(_company(), OBSERVED_AT)
+
+    assert result.pagination_exhausted is False
+    assert result.complete is False
+    assert result.reconciliation_eligible is False
+
+
+@pytest.mark.asyncio
+async def test_hh_preserves_explicit_archived_status() -> None:
+    archived = _detail()
+    archived["archived"] = True
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/vacancies":
+            return httpx.Response(200, json=_search(["123"]))
+        return httpx.Response(200, json=archived)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await HHSource(client, oauth_token="token", max_retries=0).collect(
+            _company(), OBSERVED_AT
+        )
+
+    assert result.vacancies[0].status is VacancyStatus.CLOSED
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio
@@ -227,13 +281,16 @@ async def test_hh_mixed_valid_and_malformed_details_preserve_valid_job() -> None
         return httpx.Response(200, json={"id": "broken"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        vacancies = await HHSource(
+        result = await HHSource(
             client,
             oauth_token="token",
             max_retries=0,
         ).collect(_company(), OBSERVED_AT)
 
-    assert [item.source_job_id for item in vacancies] == ["123"]
+    assert [item.source_job_id for item in result.vacancies] == ["123"]
+    assert result.malformed_count == 1
+    assert result.complete is False
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio
@@ -252,14 +309,14 @@ async def test_hh_retries_429_once_and_honors_retry_after() -> None:
         delays.append(delay)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        vacancies = await HHSource(
+        result = await HHSource(
             client,
             oauth_token="token",
             max_retries=1,
             sleep=sleep,
         ).collect(_company(), OBSERVED_AT)
 
-    assert vacancies == ()
+    assert result.vacancies == ()
     assert attempts == 5
     assert delays == [2.0]
 
@@ -301,8 +358,8 @@ async def test_hh_applies_exact_freshness_window_to_details() -> None:
         return httpx.Response(200, json=old_detail)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        vacancies = await HHSource(client, oauth_token="token", max_retries=0).collect(
+        result = await HHSource(client, oauth_token="token", max_retries=0).collect(
             _company(), OBSERVED_AT
         )
 
-    assert vacancies == ()
+    assert result.vacancies == ()

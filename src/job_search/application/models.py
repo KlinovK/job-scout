@@ -1,10 +1,52 @@
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from uuid import UUID
 
 from job_search.domain.classification import VacancyClassification
 from job_search.domain.enums import ATSType, SourceHealthStatus
 from job_search.domain.models import Company, JobVacancy, VacancyObservation
+
+
+class CollectionCoverage(StrEnum):
+    FULL_BOARD = "full_board"
+    FILTERED_SUBSET = "filtered_subset"
+    ROLLING_WINDOW = "rolling_window"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCollectionResult:
+    vacancies: tuple[JobVacancy, ...]
+    coverage: CollectionCoverage
+    complete: bool
+    raw_count: int
+    malformed_count: int
+    pagination_exhausted: bool
+
+    def __post_init__(self) -> None:
+        if self.raw_count < 0:
+            raise ValueError("raw_count must not be negative")
+        if self.malformed_count < 0:
+            raise ValueError("malformed_count must not be negative")
+        if self.malformed_count > self.raw_count:
+            raise ValueError("malformed_count must not exceed raw_count")
+        if len(self.vacancies) + self.malformed_count > self.raw_count:
+            raise ValueError(
+                "vacancies and malformed records must not exceed raw_count"
+            )
+        if self.complete and self.malformed_count:
+            raise ValueError("a complete result cannot contain malformed records")
+        if self.complete and not self.pagination_exhausted:
+            raise ValueError("a complete result must exhaust pagination")
+
+    @property
+    def reconciliation_eligible(self) -> bool:
+        return (
+            self.coverage is CollectionCoverage.FULL_BOARD
+            and self.complete
+            and self.malformed_count == 0
+            and self.pagination_exhausted
+        )
 
 
 @dataclass(frozen=True, slots=True)

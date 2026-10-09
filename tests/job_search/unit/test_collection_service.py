@@ -9,7 +9,12 @@ from job_search.application.errors import (
     InvalidSourceConfigurationError,
     JobSourceError,
 )
-from job_search.application.models import SourceHealthUpdate, VacancyUpsertResult
+from job_search.application.models import (
+    CollectionCoverage,
+    SourceCollectionResult,
+    SourceHealthUpdate,
+    VacancyUpsertResult,
+)
 from job_search.application.services import CollectJobsService
 from job_search.domain.enums import ATSType, SourceHealthStatus, VacancySource
 from job_search.domain.models import Company, JobVacancy
@@ -104,9 +109,30 @@ class FakeSource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         del observed_at
-        return self.jobs_by_company.get(company.id, ())
+        vacancies = tuple(self.jobs_by_company.get(company.id, ()))
+        return SourceCollectionResult(
+            vacancies=vacancies,
+            coverage=CollectionCoverage.FULL_BOARD,
+            complete=True,
+            raw_count=len(vacancies),
+            malformed_count=0,
+            pagination_exhausted=True,
+        )
+
+
+class StaticResultSource:
+    def __init__(self, result: SourceCollectionResult) -> None:
+        self.result = result
+
+    async def collect(
+        self,
+        company: Company,
+        observed_at: datetime,
+    ) -> SourceCollectionResult:
+        del company, observed_at
+        return self.result
 
 
 class FailingSource:
@@ -114,7 +140,7 @@ class FailingSource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         del company, observed_at
         raise RuntimeError("source unavailable")
 
@@ -124,7 +150,7 @@ class InvalidSource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         del company, observed_at
         raise InvalidSourceConfigurationError("unknown board")
 
@@ -134,7 +160,7 @@ class AllMalformedSource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         del company, observed_at
         raise JobSourceError("All 2 provider records were malformed")
 
@@ -150,7 +176,7 @@ class ConcurrencyTrackingSource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         del company, observed_at
         self.active += 1
         self.peak = max(self.peak, self.active)
@@ -158,7 +184,14 @@ class ConcurrencyTrackingSource:
             self.release.set()
         await self.release.wait()
         self.active -= 1
-        return ()
+        return SourceCollectionResult(
+            vacancies=(),
+            coverage=CollectionCoverage.FULL_BOARD,
+            complete=True,
+            raw_count=0,
+            malformed_count=0,
+            pagination_exhausted=True,
+        )
 
 
 class FakeProvider:
@@ -317,6 +350,37 @@ async def test_all_malformed_provider_data_is_failed_not_empty() -> None:
     assert update.status is SourceHealthStatus.FAILED
     assert update.job_count is None
     assert update.error_category == "JobSourceError"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_mixed_result_preserves_current_persistence_and_health() -> (
+    None
+):
+    company = make_company()
+    vacancy = make_vacancy(company.id)
+    companies = FakeCompanyRepository([company])
+    vacancies = FakeVacancyRepository()
+    result = SourceCollectionResult(
+        vacancies=(vacancy,),
+        coverage=CollectionCoverage.FULL_BOARD,
+        complete=False,
+        raw_count=2,
+        malformed_count=1,
+        pagination_exhausted=True,
+    )
+
+    summary = await CollectJobsService(
+        companies,
+        vacancies,
+        FakeProvider({ATSType.GREENHOUSE: StaticResultSource(result)}),
+        clock=lambda: NOW,
+    ).collect()
+
+    assert summary.jobs_fetched == 1
+    assert summary.new_jobs == 1
+    assert summary.failure_count == 0
+    assert companies.health_updates[0][1].status is SourceHealthStatus.HEALTHY
+    assert companies.health_updates[0][1].job_count == 1
 
 
 @pytest.mark.asyncio

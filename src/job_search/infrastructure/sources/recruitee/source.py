@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import re
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from html import unescape
 from urllib.parse import quote
@@ -13,6 +12,10 @@ from pydantic import ValidationError
 from job_search.application.errors import (
     InvalidSourceConfigurationError,
     JobSourceError,
+)
+from job_search.application.models import (
+    CollectionCoverage,
+    SourceCollectionResult,
 )
 from job_search.domain.enums import RemotePolicy, VacancySource, VacancyStatus
 from job_search.domain.models import Company, JobVacancy
@@ -111,7 +114,7 @@ class RecruiteeSource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         identifier = quote(company.ats_identifier, safe="")
         url = f"https://{identifier}.{self._BASE_DOMAIN}/api/offers/"
         try:
@@ -211,4 +214,11 @@ class RecruiteeSource:
             raise RecruiteeSourceError(
                 f"All {raw_count} Recruitee offers were malformed for {company.name}"
             )
-        return tuple(vacancies)
+        return SourceCollectionResult(
+            vacancies=tuple(vacancies),
+            coverage=CollectionCoverage.FULL_BOARD,
+            complete=malformed_count == 0,
+            raw_count=raw_count,
+            malformed_count=malformed_count,
+            pagination_exhausted=True,
+        )

@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from urllib.parse import quote
 from uuid import uuid4
@@ -11,6 +10,10 @@ from pydantic import ValidationError
 from job_search.application.errors import (
     InvalidSourceConfigurationError,
     JobSourceError,
+)
+from job_search.application.models import (
+    CollectionCoverage,
+    SourceCollectionResult,
 )
 from job_search.domain.enums import RemotePolicy, VacancySource, VacancyStatus
 from job_search.domain.models import Company, JobVacancy
@@ -59,58 +62,45 @@ class LeverSource:
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         sleep: Sleep = asyncio.sleep,
         logger: logging.Logger | None = None,
+        page_size: int = 100,
+        max_pages: int = 100,
     ) -> None:
+        if page_size <= 0:
+            raise ValueError("page_size must be greater than zero")
+        if max_pages <= 0:
+            raise ValueError("max_pages must be greater than zero")
         self._http_client = http_client
         self._retry_policy = retry_policy
         self._sleep = sleep
         self._logger = logger or logging.getLogger(__name__)
+        self._page_size = page_size
+        self._max_pages = max_pages
 
     async def collect(
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         identifier = quote(company.ats_identifier, safe="")
         url = f"{self._BASE_URL}/{identifier}"
-        try:
-            response = await get_with_retry(
-                self._http_client,
-                url,
-                provider=VacancySource.LEVER.value,
-                params={"mode": "json"},
-                policy=self._retry_policy,
-                sleep=self._sleep,
-                logger=self._logger,
+
+        raw_jobs: list[object] = []
+        skip = 0
+        for _ in range(self._max_pages):
+            envelope = await self._fetch_page(company, url, skip)
+            if not envelope.root:
+                break
+            raw_jobs.extend(envelope.root)
+            skip += len(envelope.root)
+        else:
+            raise LeverSourceError(
+                f"Lever pagination exceeded safety limit for {company.name}"
             )
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise LeverSourceError(
-                f"Lever request timed out for {company.name}"
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                raise InvalidSourceConfigurationError(
-                    f"Unknown Lever site for {company.name}"
-                ) from exc
-            raise LeverSourceError(
-                f"Lever returned HTTP {exc.response.status_code} for {company.name}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise LeverSourceError(
-                f"Lever request failed for {company.name}: {exc}"
-            ) from exc
 
-        try:
-            envelope = LeverPostingsEnvelopeDTO.model_validate_json(response.content)
-        except ValidationError as exc:
-            raise LeverSourceError(
-                f"Malformed Lever response for {company.name}"
-            ) from exc
-
-        raw_count = len(envelope.root)
+        raw_count = len(raw_jobs)
         malformed_count = 0
         vacancies: list[JobVacancy] = []
-        for index, raw_job in enumerate(envelope.root):
+        for index, raw_job in enumerate(raw_jobs):
             try:
                 job = LeverPostingDTO.model_validate(raw_job)
                 published_at = _published_at(job.createdAt)
@@ -162,4 +152,56 @@ class LeverSource:
             raise LeverSourceError(
                 f"All {raw_count} Lever jobs were malformed for {company.name}"
             )
-        return tuple(vacancies)
+        return SourceCollectionResult(
+            vacancies=tuple(vacancies),
+            coverage=CollectionCoverage.FULL_BOARD,
+            complete=malformed_count == 0,
+            raw_count=raw_count,
+            malformed_count=malformed_count,
+            pagination_exhausted=True,
+        )
+
+    async def _fetch_page(
+        self,
+        company: Company,
+        url: str,
+        skip: int,
+    ) -> LeverPostingsEnvelopeDTO:
+        try:
+            response = await get_with_retry(
+                self._http_client,
+                url,
+                provider=VacancySource.LEVER.value,
+                params={
+                    "mode": "json",
+                    "skip": str(skip),
+                    "limit": str(self._page_size),
+                },
+                policy=self._retry_policy,
+                sleep=self._sleep,
+                logger=self._logger,
+            )
+            response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise LeverSourceError(
+                f"Lever request timed out for {company.name}"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise InvalidSourceConfigurationError(
+                    f"Unknown Lever site for {company.name}"
+                ) from exc
+            raise LeverSourceError(
+                f"Lever returned HTTP {exc.response.status_code} for {company.name}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise LeverSourceError(
+                f"Lever request failed for {company.name}: {exc}"
+            ) from exc
+
+        try:
+            return LeverPostingsEnvelopeDTO.model_validate_json(response.content)
+        except ValidationError as exc:
+            raise LeverSourceError(
+                f"Malformed Lever response for {company.name}"
+            ) from exc

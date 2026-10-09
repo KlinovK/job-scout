@@ -6,6 +6,7 @@ from uuid import UUID
 from job_search.application.models import (
     ClassificationUpsertResult,
     DeduplicationStats,
+    SourceCollectionResult,
     SourceHealthUpdate,
     VacancyUpsertResult,
 )
@@ -109,7 +110,7 @@ class JobSource(Protocol):
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]: ...
+    ) -> SourceCollectionResult: ...
 
 
 class JobSourceProvider(Protocol):

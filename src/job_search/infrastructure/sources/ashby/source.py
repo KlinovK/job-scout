@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from urllib.parse import quote, urlparse
 from uuid import uuid4
@@ -11,6 +10,10 @@ from pydantic import ValidationError
 from job_search.application.errors import (
     InvalidSourceConfigurationError,
     JobSourceError,
+)
+from job_search.application.models import (
+    CollectionCoverage,
+    SourceCollectionResult,
 )
 from job_search.domain.enums import RemotePolicy, VacancySource, VacancyStatus
 from job_search.domain.models import Company, JobVacancy
@@ -76,7 +79,7 @@ class AshbySource:
         self,
         company: Company,
         observed_at: datetime,
-    ) -> Sequence[JobVacancy]:
+    ) -> SourceCollectionResult:
         identifier = quote(company.ats_identifier, safe="")
         url = f"{self._BASE_URL}/{identifier}"
         try:
@@ -171,4 +174,11 @@ class AshbySource:
             raise AshbySourceError(
                 f"All {raw_count} Ashby jobs were malformed for {company.name}"
             )
-        return tuple(vacancies)
+        return SourceCollectionResult(
+            vacancies=tuple(vacancies),
+            coverage=CollectionCoverage.FULL_BOARD,
+            complete=malformed_count == 0,
+            raw_count=raw_count,
+            malformed_count=malformed_count,
+            pagination_exhausted=True,
+        )

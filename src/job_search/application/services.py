@@ -193,7 +193,8 @@ class CollectJobsService:
             )
 
         try:
-            vacancies = await source.collect(company, checked_at)
+            result = await source.collect(company, checked_at)
+            vacancies = result.vacancies
             status = (
                 SourceHealthStatus.HEALTHY if vacancies else SourceHealthStatus.EMPTY
             )
@@ -236,6 +237,12 @@ class CollectJobsService:
                 "source": company.ats_type.value,
                 "result": status.value,
                 "jobs_fetched": len(vacancies),
+                "coverage": result.coverage.value,
+                "complete": result.complete,
+                "raw_count": result.raw_count,
+                "malformed_count": result.malformed_count,
+                "pagination_exhausted": result.pagination_exhausted,
+                "reconciliation_eligible": result.reconciliation_eligible,
             },
         )
         return _CompanyCollectionOutcome(

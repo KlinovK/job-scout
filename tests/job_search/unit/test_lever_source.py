@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from job_search.application.errors import InvalidSourceConfigurationError
+from job_search.application.models import CollectionCoverage
 from job_search.domain.enums import ATSType, RemotePolicy, VacancySource
 from job_search.infrastructure.http import RetryPolicy
 from job_search.infrastructure.sources.lever import LeverSource, LeverSourceError
@@ -36,6 +37,9 @@ async def _collect(response: httpx.Response):
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v0/postings/example"
         assert request.url.params["mode"] == "json"
+        assert request.url.params["limit"] == "100"
+        if request.url.params["skip"] != "0":
+            return httpx.Response(200, json=[])
         return response
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -46,10 +50,14 @@ async def _collect(response: httpx.Response):
 
 @pytest.mark.asyncio
 async def test_successful_response_is_normalized() -> None:
-    vacancies = await _collect(httpx.Response(200, json=[_job("job-42")]))
+    result = await _collect(httpx.Response(200, json=[_job("job-42")]))
 
-    assert len(vacancies) == 1
-    vacancy = vacancies[0]
+    assert result.coverage is CollectionCoverage.FULL_BOARD
+    assert result.complete is True
+    assert result.pagination_exhausted is True
+    assert result.reconciliation_eligible is True
+    assert len(result.vacancies) == 1
+    vacancy = result.vacancies[0]
     assert vacancy.source is VacancySource.LEVER
     assert vacancy.source_job_id == "job-42"
     assert vacancy.title == "iOS Engineer"
@@ -66,8 +74,56 @@ async def test_multiple_and_empty_responses() -> None:
     )
     empty = await _collect(httpx.Response(200, json=[]))
 
-    assert [item.source_job_id for item in multiple] == ["one", "two"]
-    assert empty == ()
+    assert [item.source_job_id for item in multiple.vacancies] == ["one", "two"]
+    assert empty.vacancies == ()
+
+
+@pytest.mark.asyncio
+async def test_exhaustive_pagination_uses_skip_and_limit() -> None:
+    skips: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        skips.append(int(request.url.params["skip"]))
+        skip = request.url.params["skip"]
+        if skip == "0":
+            return httpx.Response(200, json=[_job("one"), _job("two")])
+        if skip == "2":
+            return httpx.Response(200, json=[_job("three")])
+        return httpx.Response(200, json=[])
+
+    company = make_company(ats_type=ATSType.LEVER)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await LeverSource(
+            client,
+            retry_policy=NO_RETRY,
+            page_size=2,
+        ).collect(company, OBSERVED_AT)
+
+    assert skips == [0, 2, 3]
+    assert [item.source_job_id for item in result.vacancies] == [
+        "one",
+        "two",
+        "three",
+    ]
+    assert result.raw_count == 3
+    assert result.pagination_exhausted is True
+    assert result.reconciliation_eligible is True
+
+
+@pytest.mark.asyncio
+async def test_pagination_limit_fails_instead_of_returning_truncated_result() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[_job("one")])
+
+    company = make_company(ats_type=ATSType.LEVER)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LeverSourceError, match="safety limit"):
+            await LeverSource(
+                client,
+                retry_policy=NO_RETRY,
+                page_size=1,
+                max_pages=1,
+            ).collect(company, OBSERVED_AT)
 
 
 @pytest.mark.asyncio
@@ -112,9 +168,12 @@ async def test_malformed_response_is_rejected(response: httpx.Response) -> None:
 
 @pytest.mark.asyncio
 async def test_malformed_individual_job_is_skipped() -> None:
-    vacancies = await _collect(httpx.Response(200, json=[{"id": "bad"}, _job("valid")]))
+    result = await _collect(httpx.Response(200, json=[{"id": "bad"}, _job("valid")]))
 
-    assert [item.source_job_id for item in vacancies] == ["valid"]
+    assert [item.source_job_id for item in result.vacancies] == ["valid"]
+    assert result.malformed_count == 1
+    assert result.complete is False
+    assert result.reconciliation_eligible is False
 
 
 @pytest.mark.asyncio
@@ -128,9 +187,9 @@ async def test_remote_policy_variants() -> None:
     hybrid = _job("hybrid", workplace_type="hybrid")
     onsite = _job("onsite", workplace_type="on-site")
     unknown = _job("unknown", workplace_type="office")
-    vacancies = await _collect(httpx.Response(200, json=[hybrid, onsite, unknown]))
+    result = await _collect(httpx.Response(200, json=[hybrid, onsite, unknown]))
 
-    assert [item.remote_policy for item in vacancies] == [
+    assert [item.remote_policy for item in result.vacancies] == [
         RemotePolicy.HYBRID,
         RemotePolicy.ONSITE,
         RemotePolicy.UNKNOWN,

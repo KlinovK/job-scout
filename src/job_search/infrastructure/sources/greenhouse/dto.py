@@ -17,7 +17,14 @@ class GreenhouseJobDTO(BaseModel):
     location: GreenhouseLocationDTO | None = None
 
 
+class GreenhouseJobsMetaDTO(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    total: int
+
+
 class GreenhouseJobsEnvelopeDTO(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     jobs: list[JsonValue]
+    meta: GreenhouseJobsMetaDTO | None = None
