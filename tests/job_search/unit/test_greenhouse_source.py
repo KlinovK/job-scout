@@ -5,6 +5,7 @@ import pytest
 
 from job_search.application.errors import InvalidSourceConfigurationError
 from job_search.domain.enums import RemotePolicy
+from job_search.infrastructure.http import RetryPolicy
 from job_search.infrastructure.sources.greenhouse import (
     GreenhouseSource,
     GreenhouseSourceError,
@@ -12,6 +13,7 @@ from job_search.infrastructure.sources.greenhouse import (
 from tests.job_search.factories import make_company
 
 OBSERVED_AT = datetime(2026, 9, 17, 10, 0, tzinfo=UTC)
+NO_RETRY = RetryPolicy(max_retries=0)
 
 
 def _job(job_id: int, title: str = "iOS Engineer") -> dict[str, object]:
@@ -30,7 +32,9 @@ async def _collect(response: httpx.Response):
         return response
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        return await GreenhouseSource(client).collect(make_company(), OBSERVED_AT)
+        return await GreenhouseSource(client, retry_policy=NO_RETRY).collect(
+            make_company(), OBSERVED_AT
+        )
 
 
 @pytest.mark.asyncio
@@ -88,7 +92,118 @@ async def test_timeout_is_wrapped() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(GreenhouseSourceError, match="timed out.*Example"):
-            await GreenhouseSource(client).collect(make_company(), OBSERVED_AT)
+            await GreenhouseSource(client, retry_policy=NO_RETRY).collect(
+                make_company(), OBSERVED_AT
+            )
+
+
+@pytest.mark.asyncio
+async def test_transient_status_is_retried_by_source() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"jobs": [_job(42)]})
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        vacancies = await GreenhouseSource(client, sleep=sleep).collect(
+            make_company(), OBSERVED_AT
+        )
+
+    assert [item.source_job_id for item in vacancies] == ["42"]
+    assert attempts == 2
+    assert delays == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_transport_retry_keeps_provider_error_context() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("unavailable", request=request)
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    policy = RetryPolicy(max_retries=1)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GreenhouseSourceError, match="request failed.*Example"):
+            await GreenhouseSource(
+                client,
+                retry_policy=policy,
+                sleep=sleep,
+            ).collect(make_company(), OBSERVED_AT)
+
+    assert attempts == 2
+    assert delays == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_invalid_configuration_404_is_not_retried() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(404)
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(InvalidSourceConfigurationError):
+            await GreenhouseSource(client, sleep=sleep).collect(
+                make_company(), OBSERVED_AT
+            )
+
+    assert attempts == 1
+    assert delays == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, content=b"{"),
+        httpx.Response(
+            200,
+            json={"jobs": [{"id": "bad"}, {"title": "Broken"}]},
+        ),
+    ],
+)
+async def test_successful_malformed_data_is_not_retried(
+    response: httpx.Response,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return response
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GreenhouseSourceError):
+            await GreenhouseSource(client, sleep=sleep).collect(
+                make_company(), OBSERVED_AT
+            )
+
+    assert attempts == 1
+    assert delays == []
 
 
 @pytest.mark.asyncio

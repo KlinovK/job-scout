@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -13,6 +14,12 @@ from job_search.application.errors import (
 )
 from job_search.domain.enums import RemotePolicy, VacancySource, VacancyStatus
 from job_search.domain.models import Company, JobVacancy
+from job_search.infrastructure.http import (
+    DEFAULT_RETRY_POLICY,
+    RetryPolicy,
+    Sleep,
+    get_with_retry,
+)
 from job_search.infrastructure.sources.lever.dto import (
     LeverPostingDTO,
     LeverPostingsEnvelopeDTO,
@@ -49,9 +56,13 @@ class LeverSource:
         self,
         http_client: httpx.AsyncClient,
         *,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        sleep: Sleep = asyncio.sleep,
         logger: logging.Logger | None = None,
     ) -> None:
         self._http_client = http_client
+        self._retry_policy = retry_policy
+        self._sleep = sleep
         self._logger = logger or logging.getLogger(__name__)
 
     async def collect(
@@ -62,7 +73,15 @@ class LeverSource:
         identifier = quote(company.ats_identifier, safe="")
         url = f"{self._BASE_URL}/{identifier}"
         try:
-            response = await self._http_client.get(url, params={"mode": "json"})
+            response = await get_with_retry(
+                self._http_client,
+                url,
+                provider=VacancySource.LEVER.value,
+                params={"mode": "json"},
+                policy=self._retry_policy,
+                sleep=self._sleep,
+                logger=self._logger,
+            )
             response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise LeverSourceError(

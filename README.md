@@ -27,6 +27,9 @@ opaque score.
 - **Asynchronous ingestion:** one shared `httpx.AsyncClient`, bounded
   per-company concurrency, and isolated provider failures so one broken source
   does not stop the remaining collection run.
+- **Bounded GET reliability:** transient transport failures, HTTP 429, and
+  selected 5xx responses use two retries with deterministic exponential
+  backoff; server-requested delays are validated and capped.
 - **Normalized domain model:** provider DTOs are validated and translated into
   framework-independent companies, vacancies, source observations, health
   states, and classifications.
@@ -127,6 +130,17 @@ writes use a short application-level lock. This keeps network I/O efficient,
 avoids SQLite writer contention, and records per-company failures without
 cancelling unrelated work.
 
+### Explicit retry ownership
+
+Safe GET requests have one Infrastructure-level retry owner: one initial
+attempt plus two retries for transient transport failures, HTTP 429, and HTTP
+500/502/503/504. Backoff is bounded, cancellation escapes immediately, and
+permanent HTTP or successful malformed-data failures are never retried. This
+keeps brief provider outages from becoming false collection failures without
+hiding deterministic defects. `Retry-After` supports integer delta-seconds;
+malformed or date-form values fall back to local backoff, and every delay is
+capped at 10 seconds.
+
 ### Provenance-first canonicalization
 
 JobScout stores both a canonical vacancy and its source observations. It merges
@@ -150,7 +164,7 @@ any database write.
 
 ## Quality
 
-The current repository contains **199 passing tests**, including unit,
+The current repository contains **229 passing tests**, including unit,
 integration, migration, adapter-contract, canonicalization, concurrency, and
 classification regression coverage.
 
@@ -175,14 +189,13 @@ There is no CI badge because CI has not been implemented yet.
 - source observations, conservative cross-source canonicalization, and
   duplicate diagnostics;
 - persisted source-health and malformed-source semantics;
+- bounded retry/backoff for safe GET source operations;
 - deterministic `ios-v1` classification and candidate inspection;
 - a separate Telegram-to-Saved-Messages collection path;
-- strict static analysis and a 199-test automated suite.
+- strict static analysis and a 229-test automated suite.
 
 ### In Progress / Next
 
-- consistent retry/backoff policy across source adapters (hh.ru already has
-  limited targeted retry behavior);
 - vacancy lifecycle reconciliation when roles disappear from a source;
 - a query layer over normalized vacancies and classifications;
 - operational hardening of scheduled collection and local runtime security.
@@ -336,6 +349,8 @@ main.py                       Separate legacy Telegram collector
 - Greenhouse list responses do not provide a reliable publication timestamp,
   so those records may have `published_at = NULL`.
 - hh.ru requires OAuth; its adapter is disabled in the default registry.
+- Retry/backoff is intentionally limited to GET requests. AgileFluent's
+  read-only search endpoint uses POST and is not automatically retried.
 - Remote, geography, language, and relocation decisions are conservative,
   phrase-based signals for human review—not legal eligibility conclusions.
 - The current classifier targets iOS relevance only. Python, full-stack,
@@ -350,11 +365,10 @@ main.py                       Separate legacy Telegram collector
 
 ## Roadmap
 
-1. Generalize source reliability with consistent retry and backoff semantics.
-2. Reconcile vacancy lifecycle and stale/closed records.
-3. Add a query layer for normalized vacancies and classifications.
-4. Harden the operational collection pipeline and observability.
-5. Expose reviewed query use cases through FastAPI.
-6. Define AI analysis contracts, fixtures, and an evaluation dataset.
-7. Add structured LLM analysis and ranking behind those evaluations.
-8. Unify delivery channels with the normalized pipeline.
+1. Reconcile vacancy lifecycle and stale/closed records.
+2. Add a query layer for normalized vacancies and classifications.
+3. Harden the operational collection pipeline and observability.
+4. Expose reviewed query use cases through FastAPI.
+5. Define AI analysis contracts, fixtures, and an evaluation dataset.
+6. Add structured LLM analysis and ranking behind those evaluations.
+7. Unify delivery channels with the normalized pipeline.

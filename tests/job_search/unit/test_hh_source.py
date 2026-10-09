@@ -265,6 +265,32 @@ async def test_hh_retries_429_once_and_honors_retry_after() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hh_has_one_retry_owner_without_attempt_amplification() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503)
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(HHSourceError, match="503"):
+            await HHSource(
+                client,
+                oauth_token="token",
+                max_retries=1,
+                sleep=sleep,
+            ).collect(_company(), OBSERVED_AT)
+
+    assert attempts == 2
+    assert delays == [0.5]
+
+
+@pytest.mark.asyncio
 async def test_hh_applies_exact_freshness_window_to_details() -> None:
     old_detail = _detail()
     old_detail["published_at"] = "2026-09-24T11:59:59+00:00"

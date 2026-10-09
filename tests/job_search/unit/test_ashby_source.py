@@ -5,10 +5,12 @@ import pytest
 
 from job_search.application.errors import InvalidSourceConfigurationError
 from job_search.domain.enums import ATSType, RemotePolicy, VacancySource
+from job_search.infrastructure.http import RetryPolicy
 from job_search.infrastructure.sources.ashby import AshbySource, AshbySourceError
 from tests.job_search.factories import make_company
 
 OBSERVED_AT = datetime(2026, 9, 17, 10, 0, tzinfo=UTC)
+NO_RETRY = RetryPolicy(max_retries=0)
 
 
 def _job(
@@ -44,7 +46,9 @@ async def _collect(response: httpx.Response):
         return response
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        return await AshbySource(client).collect(company, OBSERVED_AT)
+        return await AshbySource(client, retry_policy=NO_RETRY).collect(
+            company, OBSERVED_AT
+        )
 
 
 @pytest.mark.asyncio
@@ -126,7 +130,9 @@ async def test_timeout_is_wrapped() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(AshbySourceError, match="timed out.*Example"):
-            await AshbySource(client).collect(company, OBSERVED_AT)
+            await AshbySource(client, retry_policy=NO_RETRY).collect(
+                company, OBSERVED_AT
+            )
 
 
 @pytest.mark.asyncio

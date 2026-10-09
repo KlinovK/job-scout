@@ -2,7 +2,7 @@ import asyncio
 import html
 import logging
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from uuid import NAMESPACE_URL, uuid5
 
@@ -16,13 +16,12 @@ from job_search.application.errors import (
 from job_search.domain.canonicalization import normalize_canonical_url
 from job_search.domain.enums import RemotePolicy, VacancySource, VacancyStatus
 from job_search.domain.models import Company, JobVacancy
+from job_search.infrastructure.http import RetryPolicy, Sleep, get_with_retry
 from job_search.infrastructure.sources.hh.dto import (
     HHSalaryDTO,
     HHSearchEnvelopeDTO,
     HHVacancyDTO,
 )
-
-Sleep = Callable[[float], Awaitable[None]]
 
 _SEARCH_TERMS = (
     "iOS",
@@ -104,7 +103,7 @@ class HHSource:
         self._max_age_hours = max_age_hours
         self._max_pages_per_query = max_pages_per_query
         self._detail_concurrency = detail_concurrency
-        self._max_retries = max_retries
+        self._retry_policy = RetryPolicy(max_retries=max_retries)
         self._sleep = sleep
         self._logger = logger or logging.getLogger(__name__)
 
@@ -272,45 +271,33 @@ class HHSource:
         params: dict[str, str] | None = None,
     ) -> object:
         headers = {"Authorization": f"Bearer {self._oauth_token}"}
-        for attempt in range(self._max_retries + 1):
-            try:
-                response = await self._client.get(
-                    f"{self.api_base_url}{path}",
-                    params=params,
-                    headers=headers,
-                )
-            except httpx.TimeoutException as exc:
-                if attempt < self._max_retries:
-                    await self._sleep(0.5 * (attempt + 1))
-                    continue
-                raise HHSourceError("hh.ru request timed out") from exc
-            except httpx.HTTPError as exc:
-                raise HHSourceError(f"hh.ru request failed: {exc}") from exc
+        try:
+            response = await get_with_retry(
+                self._client,
+                f"{self.api_base_url}{path}",
+                provider=VacancySource.HH.value,
+                params=params,
+                headers=headers,
+                policy=self._retry_policy,
+                sleep=self._sleep,
+                logger=self._logger,
+            )
+        except httpx.TimeoutException as exc:
+            raise HHSourceError("hh.ru request timed out") from exc
+        except httpx.RequestError as exc:
+            raise HHSourceError(f"hh.ru request failed: {exc}") from exc
 
-            if response.status_code == 429 or response.status_code >= 500:
-                if attempt < self._max_retries:
-                    retry_after = response.headers.get("Retry-After")
-                    try:
-                        delay = float(retry_after or attempt + 1)
-                    except ValueError:
-                        delay = float(attempt + 1)
-                    delay = min(delay, 5.0)
-                    await self._sleep(delay)
-                    continue
-            if response.status_code == 401:
-                raise InvalidSourceConfigurationError(
-                    "hh.ru rejected JOB_SEARCH_HH_API_TOKEN"
-                )
-            if response.status_code == 429:
-                raise HHSourceError("hh.ru rate limit exceeded (HTTP 429)")
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise HHSourceError(
-                    f"hh.ru returned HTTP {response.status_code}"
-                ) from exc
-            try:
-                return response.json()
-            except ValueError as exc:
-                raise HHSourceError("Malformed hh.ru JSON response") from exc
-        raise AssertionError("unreachable")
+        if response.status_code == 401:
+            raise InvalidSourceConfigurationError(
+                "hh.ru rejected JOB_SEARCH_HH_API_TOKEN"
+            )
+        if response.status_code == 429:
+            raise HHSourceError("hh.ru rate limit exceeded (HTTP 429)")
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HHSourceError(f"hh.ru returned HTTP {response.status_code}") from exc
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise HHSourceError("Malformed hh.ru JSON response") from exc
