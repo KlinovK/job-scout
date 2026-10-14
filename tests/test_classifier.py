@@ -186,8 +186,25 @@ class SmartClassifierTests(unittest.TestCase):
     def test_resume_and_candidate_posts_are_rejected(self) -> None:
         self.assert_rejected("#резюме Senior iOS Engineer")
         self.assert_rejected("#resume Python Backend Developer")
+        self.assert_rejected("#CV Senior iOS Engineer vacancy, remote")
+        self.assert_rejected("#cv Junior Python Backend Developer vacancy")
+        self.assert_rejected("Senior iOS Engineer — remote\n#Cv")
         self.assert_rejected("Open to work as a Project Manager")
         self.assert_rejected("Ищу работу Fullstack Developer")
+
+    def test_cv_text_without_exact_hashtag_marker_is_not_excluded(self) -> None:
+        self.assert_category(
+            "Senior iOS Engineer — remote. Send your CV to apply.",
+            "iOS/Mobile",
+        )
+        self.assert_category(
+            "Hiring Senior iOS Engineer for a CVBuilder platform, remote",
+            "iOS/Mobile",
+        )
+        self.assert_category(
+            "Hiring Senior iOS Engineer for a #CVBuilder platform, remote",
+            "iOS/Mobile",
+        )
 
     def test_generic_junior_role_is_rejected(self) -> None:
         self.assert_rejected("Вакансия: Junior Graphic Designer")

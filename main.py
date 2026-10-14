@@ -353,6 +353,7 @@ NON_VACANCY_KEYWORDS = (
 HARD_EXCLUSION_KEYWORDS = (
     "#резюме",
     "#resume",
+    "#cv",
     "ищу работу",
     "ищу вакансию",
     "ищу проект",
