@@ -164,7 +164,7 @@ any database write.
 
 ## Quality
 
-The current repository contains **229 passing tests**, including unit,
+The current repository contains **253 passing tests**, including unit,
 integration, migration, adapter-contract, canonicalization, concurrency, and
 classification regression coverage.
 
@@ -276,6 +276,32 @@ The disabled hh.ru source requires a registered OAuth token in
 
 No anonymous fallback is attempted because anonymous hh.ru vacancy search is
 CAPTCHA-limited.
+
+### Technical management discovery
+
+JobScout discovery includes a separate `technical_management` search group.
+Greenhouse, Lever, Ashby, and Recruitee still collect complete company boards,
+so they require no role-specific requests. AgileFluent retains its supported
+management profile (`Project Manager`, `Program Manager`, `Delivery Manager`,
+`Scrum Master`, `Agile Coach`, and `Technical Program Manager (TPM)`) within
+the existing 24-hour rolling window.
+
+The hh.ru adapter adds eight bounded phrase searches for project, program,
+delivery, product, product-owner, Scrum, and core Russian project-management
+titles. These searches retain the 72-hour window and the configured page cap.
+Broader coordinator, implementation, operations, and generic team-lead terms
+are not queried separately to limit request volume and false positives.
+
+This expands **discovery**, not classification. The `ios-v1` classifier and
+the `candidates` command still represent only the iOS profile. Management
+vacancies are stored in `job_vacancies`; they can be inspected with a
+read-only SQLite query, followed by the existing provenance command:
+
+```bash
+sqlite3 -readonly job_search.db \
+  "SELECT id, title, employer_name, url FROM job_vacancies WHERE title LIKE '%Manager%' OR title LIKE '%Owner%' OR title LIKE '%Scrum%' ORDER BY last_seen_at DESC;"
+.venv/bin/job-search vacancy sources <canonical-vacancy-uuid>
+```
 
 ### Configuration
 

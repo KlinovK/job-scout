@@ -15,7 +15,12 @@ from job_search.domain.enums import (
     VacancySource,
     VacancyStatus,
 )
-from job_search.infrastructure.sources.hh import HHSource, HHSourceError
+from job_search.infrastructure.sources.hh import (
+    HH_SEARCH_TERMS,
+    HH_SEARCH_TERMS_BY_CATEGORY,
+    HHSource,
+    HHSourceError,
+)
 from tests.job_search.factories import make_company
 
 OBSERVED_AT = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
@@ -62,14 +67,40 @@ def test_hh_source_error_uses_common_source_error_taxonomy() -> None:
     assert issubclass(HHSourceError, JobSourceError)
 
 
+def test_hh_search_terms_preserve_ios_and_bound_management_queries() -> None:
+    assert HH_SEARCH_TERMS_BY_CATEGORY["ios_engineering"] == (
+        "iOS",
+        "Swift",
+        '"Mobile Engineer"',
+        '"Mobile Developer"',
+    )
+    assert HH_SEARCH_TERMS_BY_CATEGORY["technical_management"] == (
+        '"Project Manager"',
+        '"Program Manager"',
+        '"Delivery Manager"',
+        '"Product Manager"',
+        '"Product Owner"',
+        '"Scrum Master"',
+        '"Менеджер проектов"',
+        '"Руководитель проектов"',
+    )
+    assert len(HH_SEARCH_TERMS) == len(set(HH_SEARCH_TERMS))
+    assert len(HH_SEARCH_TERMS) <= 12
+
+
 @pytest.mark.asyncio
 async def test_hh_normalizes_full_vacancy_and_deduplicates_queries() -> None:
     requests: list[str] = []
+    search_terms: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer token"
         requests.append(request.url.path)
         if request.url.path == "/vacancies":
+            search_terms.append(request.url.params["text"])
+            assert request.url.params["search_field"] == "name"
+            assert request.url.params["date_from"] == "2026-09-24T12:00:00+00:00"
+            assert request.url.params["per_page"] == "100"
             return httpx.Response(200, json=_search(["123"]))
         return httpx.Response(200, json=_detail())
 
@@ -78,8 +109,9 @@ async def test_hh_normalizes_full_vacancy_and_deduplicates_queries() -> None:
             _company(), OBSERVED_AT
         )
 
-    assert requests.count("/vacancies") == 4
+    assert requests.count("/vacancies") == len(HH_SEARCH_TERMS)
     assert requests.count("/vacancies/123") == 1
+    assert search_terms == list(HH_SEARCH_TERMS)
     assert result.coverage is CollectionCoverage.ROLLING_WINDOW
     assert result.complete is True
     assert result.pagination_exhausted is True
@@ -134,18 +166,22 @@ async def test_hh_paginates_and_stops_at_provider_page_count() -> None:
             _company(), OBSERVED_AT
         )
 
-    assert pages == [0, 1] * 4
+    assert pages == [0, 1] * len(HH_SEARCH_TERMS)
     assert {item.source_job_id for item in result.vacancies} == {"1", "2"}
     assert result.pagination_exhausted is True
 
 
 @pytest.mark.asyncio
 async def test_hh_page_cap_is_explicitly_incomplete() -> None:
+    search_requests = 0
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal search_requests
         if request.url.path.startswith("/vacancies/"):
             return httpx.Response(
                 200, json=_detail(request.url.path.rsplit("/", 1)[-1])
             )
+        search_requests += 1
         return httpx.Response(200, json=_search(["123"], pages=2))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -159,6 +195,7 @@ async def test_hh_page_cap_is_explicitly_incomplete() -> None:
     assert result.pagination_exhausted is False
     assert result.complete is False
     assert result.reconciliation_eligible is False
+    assert search_requests == len(HH_SEARCH_TERMS)
 
 
 @pytest.mark.asyncio
@@ -317,7 +354,7 @@ async def test_hh_retries_429_once_and_honors_retry_after() -> None:
         ).collect(_company(), OBSERVED_AT)
 
     assert result.vacancies == ()
-    assert attempts == 5
+    assert attempts == len(HH_SEARCH_TERMS) + 1
     assert delays == [2.0]
 
 

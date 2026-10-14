@@ -8,6 +8,10 @@ from job_search.application.errors import InvalidSourceConfigurationError
 from job_search.application.models import CollectionCoverage
 from job_search.domain.enums import ATSType, RemotePolicy, VacancySource
 from job_search.infrastructure.sources.agilefluent import (
+    DEFAULT_SEARCH_PROFILES,
+    ENTRY_LEVEL_ENGINEERING_SEARCH_PROFILE,
+    IOS_ENGINEERING_SEARCH_PROFILE,
+    TECHNICAL_MANAGEMENT_SEARCH_PROFILE,
     AgileFluentSearchProfile,
     AgileFluentSource,
     AgileFluentSourceError,
@@ -68,6 +72,40 @@ async def _collect(response: httpx.Response):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         source = AgileFluentSource(client, profiles=(PROFILE,))
         return await source.collect(_company(), OBSERVED_AT)
+
+
+@pytest.mark.asyncio
+async def test_default_profiles_preserve_engineering_and_supported_management() -> None:
+    requests: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload["filters"])
+        return httpx.Response(200, json={"data": [], "hasMore": False})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await AgileFluentSource(client).collect(_company(), OBSERVED_AT)
+
+    assert DEFAULT_SEARCH_PROFILES == (
+        IOS_ENGINEERING_SEARCH_PROFILE,
+        ENTRY_LEVEL_ENGINEERING_SEARCH_PROFILE,
+        TECHNICAL_MANAGEMENT_SEARCH_PROFILE,
+    )
+    assert [request["roles"] for request in requests] == [
+        ["iOS Engineer", "Mobile Engineer"],
+        ["Python Developer", "Backend Engineer", "Full Stack Engineer"],
+        [
+            "Project Manager",
+            "Program Manager",
+            "Delivery Manager",
+            "Scrum Master",
+            "Agile Coach",
+            "Technical Program Manager (TPM)",
+        ],
+    ]
+    assert all(request["since"] == "24h" for request in requests)
+    assert result.coverage is CollectionCoverage.ROLLING_WINDOW
+    assert result.complete is True
 
 
 @pytest.mark.asyncio

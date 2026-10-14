@@ -2,8 +2,10 @@ import asyncio
 import html
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
+from types import MappingProxyType
+from typing import Final
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
@@ -27,11 +29,32 @@ from job_search.infrastructure.sources.hh.dto import (
     HHVacancyDTO,
 )
 
-_SEARCH_TERMS = (
-    "iOS",
-    "Swift",
-    '"Mobile Engineer"',
-    '"Mobile Developer"',
+HH_SEARCH_TERMS_BY_CATEGORY: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {
+        "ios_engineering": (
+            "iOS",
+            "Swift",
+            '"Mobile Engineer"',
+            '"Mobile Developer"',
+        ),
+        "technical_management": (
+            '"Project Manager"',
+            '"Program Manager"',
+            '"Delivery Manager"',
+            '"Product Manager"',
+            '"Product Owner"',
+            '"Scrum Master"',
+            '"Менеджер проектов"',
+            '"Руководитель проектов"',
+        ),
+    }
+)
+HH_SEARCH_TERMS: Final = tuple(
+    dict.fromkeys(
+        term
+        for category_terms in HH_SEARCH_TERMS_BY_CATEGORY.values()
+        for term in category_terms
+    )
 )
 _TAG_PATTERN = re.compile(r"<[^>]+>")
 
@@ -216,7 +239,7 @@ class HHSource:
     ) -> tuple[tuple[str, ...], bool]:
         found: dict[str, None] = {}
         pagination_exhausted = True
-        for term in _SEARCH_TERMS:
+        for term in HH_SEARCH_TERMS:
             for page in range(self._max_pages_per_query):
                 payload = await self._get_json(
                     "/vacancies",

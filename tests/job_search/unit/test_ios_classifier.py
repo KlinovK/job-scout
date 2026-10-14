@@ -93,6 +93,16 @@ def test_mobile_without_native_ios_evidence_is_rejected() -> None:
     assert result.rejection_reasons == (RejectionReason.NO_IOS_RELEVANCE,)
 
 
+def test_technical_manager_with_incidental_swift_mention_is_rejected() -> None:
+    result = classify(
+        "Technical Project Manager",
+        "Coordinate delivery for a mobile software team using Swift. Remote worldwide.",
+    )
+
+    assert result.decision is ClassificationDecision.REJECT
+    assert result.rejection_reasons == (RejectionReason.NO_IOS_RELEVANCE,)
+
+
 def test_mixed_android_ios_role_is_possible() -> None:
     result = classify(
         "Senior Android and iOS Engineer",

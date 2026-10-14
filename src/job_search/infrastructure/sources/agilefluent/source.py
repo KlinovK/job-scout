@@ -39,28 +39,32 @@ class AgileFluentSearchProfile:
         return grade.casefold() in allowed
 
 
+IOS_ENGINEERING_SEARCH_PROFILE: Final = AgileFluentSearchProfile(
+    roles=("iOS Engineer", "Mobile Engineer"),
+    grades=("middle", "senior", "lead"),
+    accepted_grades=("unknown", "middle", "senior", "lead"),
+)
+ENTRY_LEVEL_ENGINEERING_SEARCH_PROFILE: Final = AgileFluentSearchProfile(
+    roles=("Python Developer", "Backend Engineer", "Full Stack Engineer"),
+    grades=("intern", "junior"),
+)
+TECHNICAL_MANAGEMENT_SEARCH_PROFILE: Final = AgileFluentSearchProfile(
+    roles=(
+        "Project Manager",
+        "Program Manager",
+        "Delivery Manager",
+        "Scrum Master",
+        "Agile Coach",
+        "Technical Program Manager (TPM)",
+    ),
+    grades=("junior", "middle", "senior", "lead"),
+    accepted_grades=("unknown", "junior", "middle", "senior", "lead"),
+)
+
 DEFAULT_SEARCH_PROFILES: Final = (
-    AgileFluentSearchProfile(
-        roles=("iOS Engineer", "Mobile Engineer"),
-        grades=("middle", "senior", "lead"),
-        accepted_grades=("unknown", "middle", "senior", "lead"),
-    ),
-    AgileFluentSearchProfile(
-        roles=("Python Developer", "Backend Engineer", "Full Stack Engineer"),
-        grades=("intern", "junior"),
-    ),
-    AgileFluentSearchProfile(
-        roles=(
-            "Project Manager",
-            "Program Manager",
-            "Delivery Manager",
-            "Scrum Master",
-            "Agile Coach",
-            "Technical Program Manager (TPM)",
-        ),
-        grades=("junior", "middle", "senior", "lead"),
-        accepted_grades=("unknown", "junior", "middle", "senior", "lead"),
-    ),
+    IOS_ENGINEERING_SEARCH_PROFILE,
+    ENTRY_LEVEL_ENGINEERING_SEARCH_PROFILE,
+    TECHNICAL_MANAGEMENT_SEARCH_PROFILE,
 )
 
 _TARGET_GEOGRAPHY: Final = (
