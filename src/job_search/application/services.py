@@ -16,6 +16,7 @@ from job_search.application.models import (
 )
 from job_search.application.ports import (
     ClassificationRepository,
+    CollectionPersistence,
     CompanyRepository,
     JobSourceProvider,
     VacancyClassifier,
@@ -58,7 +59,7 @@ class CollectJobsService:
     def __init__(
         self,
         company_repository: CompanyRepository,
-        vacancy_repository: VacancyRepository,
+        collection_persistence: CollectionPersistence,
         source_provider: JobSourceProvider,
         *,
         clock: Clock = utc_now,
@@ -68,7 +69,7 @@ class CollectJobsService:
         if max_concurrency <= 0:
             raise ValueError("max_concurrency must be greater than zero")
         self._companies = company_repository
-        self._vacancies = vacancy_repository
+        self._collection_persistence = collection_persistence
         self._sources = source_provider
         self._clock = clock
         self._logger = logger or logging.getLogger(__name__)
@@ -194,23 +195,6 @@ class CollectJobsService:
 
         try:
             result = await source.collect(company, checked_at)
-            vacancies = result.vacancies
-            status = (
-                SourceHealthStatus.HEALTHY if vacancies else SourceHealthStatus.EMPTY
-            )
-            # SQLite supports concurrent readers but only one writer. Keep HTTP
-            # collection concurrent and serialize the short persistence phase.
-            async with self._persistence_lock:
-                upserted = await self._vacancies.upsert_many(vacancies)
-                await self._companies.update_health(
-                    company.id,
-                    SourceHealthUpdate(
-                        checked_at=checked_at,
-                        status=status,
-                        job_count=len(vacancies),
-                        error_category=None,
-                    ),
-                )
         except InvalidSourceConfigurationError as exc:
             return await self._failure_outcome(
                 company,
@@ -230,6 +214,38 @@ class CollectJobsService:
                 exc,
             )
 
+        vacancies = result.vacancies
+        status = SourceHealthStatus.HEALTHY if vacancies else SourceHealthStatus.EMPTY
+        health = SourceHealthUpdate(
+            checked_at=checked_at,
+            status=status,
+            job_count=len(vacancies),
+            error_category=None,
+        )
+        try:
+            # SQLite permits one writer at a time. Network collection remains
+            # concurrent; only the short atomic persistence phase is serialized.
+            async with self._persistence_lock:
+                persisted = await self._collection_persistence.persist_collection(
+                    company.id,
+                    result,
+                    health,
+                )
+        except Exception as exc:
+            self._logger.exception(
+                "Collection persistence failed",
+                extra={"company": company.name, "source": company.ats_type.value},
+            )
+            return await self._failure_outcome(
+                company,
+                checked_at,
+                SourceHealthStatus.FAILED,
+                exc,
+                category=f"persistence:{type(exc).__name__}",
+            )
+
+        upserted = persisted.vacancy_upsert
+
         self._logger.info(
             "Company collection completed",
             extra={
@@ -243,6 +259,7 @@ class CollectJobsService:
                 "malformed_count": result.malformed_count,
                 "pagination_exhausted": result.pagination_exhausted,
                 "reconciliation_eligible": result.reconciliation_eligible,
+                "persistence_applied": persisted.applied,
             },
         )
         return _CompanyCollectionOutcome(
@@ -263,14 +280,21 @@ class CollectJobsService:
         checked_at: datetime,
         status: SourceHealthStatus,
         error: Exception,
+        *,
+        category: str | None = None,
     ) -> _CompanyCollectionOutcome:
-        category = type(error).__name__
-        await self._record_failure_health(company, checked_at, status, category)
+        resolved_category = category or type(error).__name__
+        await self._record_failure_health(
+            company,
+            checked_at,
+            status,
+            resolved_category,
+        )
         failure = CollectionFailure(
             company_id=company.id,
             company_name=company.name,
             ats_type=company.ats_type,
-            error_category=category,
+            error_category=resolved_category,
             message=str(error),
         )
         return _CompanyCollectionOutcome(

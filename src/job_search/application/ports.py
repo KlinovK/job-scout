@@ -5,6 +5,7 @@ from uuid import UUID
 
 from job_search.application.models import (
     ClassificationUpsertResult,
+    CollectionPersistenceResult,
     DeduplicationStats,
     SourceCollectionResult,
     SourceHealthUpdate,
@@ -42,7 +43,7 @@ class CompanyRepository(Protocol):
         self,
         company_id: UUID,
         update: SourceHealthUpdate,
-    ) -> None: ...
+    ) -> bool: ...
 
 
 class VacancyRepository(Protocol):
@@ -68,6 +69,15 @@ class VacancyRepository(Protocol):
     ) -> Sequence[VacancyObservation]: ...
 
     async def deduplication_stats(self) -> DeduplicationStats: ...
+
+
+class CollectionPersistence(Protocol):
+    async def persist_collection(
+        self,
+        company_id: UUID,
+        result: SourceCollectionResult,
+        health: SourceHealthUpdate,
+    ) -> CollectionPersistenceResult: ...
 
 
 class ClassificationRepository(Protocol):

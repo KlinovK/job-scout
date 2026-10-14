@@ -4,11 +4,14 @@ from enum import StrEnum
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import func, or_, select
+from sqlalchemy import update as sqlalchemy_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from job_search.application.models import (
     ClassificationUpsertResult,
+    CollectionPersistenceResult,
     DeduplicationStats,
+    SourceCollectionResult,
     SourceHealthUpdate,
     VacancyUpsertResult,
 )
@@ -234,8 +237,6 @@ def _update_canonical_record(
     record.source_job_id = vacancy.source_job_id
     record.published_at = vacancy.published_at
     record.last_seen_at = vacancy.last_seen_at
-    record.status = vacancy.status.value
-    record.closed_at = vacancy.closed_at
 
 
 def _classification_to_record(
@@ -279,6 +280,139 @@ def _classification_to_domain(
         classified_at=record.classified_at,
         classifier_version=record.classifier_version,
     )
+
+
+async def _upsert_vacancies(
+    session: AsyncSession,
+    vacancies: Sequence[JobVacancy],
+) -> VacancyUpsertResult:
+    created = 0
+    updated = 0
+    observations_created = 0
+    cross_source_duplicates_collapsed = 0
+    for vacancy in vacancies:
+        canonical_url = vacancy.canonical_url or normalize_canonical_url(vacancy.url)
+        source_statement = select(VacancyObservationRecord).where(
+            VacancyObservationRecord.source_company_id == str(vacancy.company_id),
+            VacancyObservationRecord.discovered_via == vacancy.source.value,
+            VacancyObservationRecord.source_job_id == vacancy.source_job_id,
+        )
+        observation = await session.scalar(source_statement)
+        if observation is not None:
+            record = await session.get(
+                JobVacancyRecord,
+                observation.vacancy_id,
+            )
+            if record is None:
+                raise LookupError(
+                    f"Observation points to missing vacancy: {observation.id}"
+                )
+            observation.observation_url = vacancy.url
+            observation.canonical_url = canonical_url
+            observation.original_reference = extract_original_reference(vacancy.url)
+            observation.original_source = (
+                vacancy.original_source or vacancy.source
+            ).value
+            observation.employer_name = vacancy.employer_name
+            observation.title = vacancy.title
+            observation.work_location = vacancy.work_location
+            observation.last_seen_at = vacancy.last_seen_at
+            if (
+                record.source == vacancy.source.value
+                and record.source_job_id == vacancy.source_job_id
+            ):
+                _update_canonical_record(record, vacancy, canonical_url)
+            updated += 1
+            continue
+
+        original_reference = extract_original_reference(vacancy.url)
+        identity_conditions = [VacancyObservationRecord.canonical_url == canonical_url]
+        if original_reference is not None:
+            identity_conditions.append(
+                VacancyObservationRecord.original_reference == original_reference
+            )
+        matching_observation = await session.scalar(
+            select(VacancyObservationRecord)
+            .where(or_(*identity_conditions))
+            .order_by(VacancyObservationRecord.first_seen_at)
+        )
+        if matching_observation is None:
+            record = _vacancy_to_record(vacancy)
+            session.add(record)
+            await session.flush()
+            session.add(_new_observation(vacancy, record.id, canonical_url))
+            created += 1
+            observations_created += 1
+            continue
+
+        record = await session.get(
+            JobVacancyRecord,
+            matching_observation.vacancy_id,
+        )
+        if record is None:
+            raise LookupError("Canonical observation points to a missing vacancy")
+        session.add(_new_observation(vacancy, record.id, canonical_url))
+        observations_created += 1
+        cross_source_duplicates_collapsed += int(
+            matching_observation.discovered_via != vacancy.source.value
+        )
+        if source_trust_rank(vacancy.source) > source_trust_rank(
+            VacancySource(record.source)
+        ):
+            _update_canonical_record(record, vacancy, canonical_url)
+        updated += 1
+
+    return VacancyUpsertResult(
+        created=created,
+        updated=updated,
+        observations_created=observations_created,
+        cross_source_duplicates_collapsed=cross_source_duplicates_collapsed,
+    )
+
+
+async def _company_exists(session: AsyncSession, company_id: UUID) -> bool:
+    statement = select(CompanyRecord.id).where(CompanyRecord.id == str(company_id))
+    return await session.scalar(statement) is not None
+
+
+async def _claim_collection_success(
+    session: AsyncSession,
+    company_id: UUID,
+    checked_at: datetime,
+) -> bool:
+    statement = (
+        sqlalchemy_update(CompanyRecord)
+        .where(
+            CompanyRecord.id == str(company_id),
+            or_(
+                CompanyRecord.last_success_at.is_(None),
+                CompanyRecord.last_success_at < checked_at,
+            ),
+        )
+        .values(last_success_at=checked_at)
+        .returning(CompanyRecord.id)
+    )
+    if await session.scalar(statement) is not None:
+        return True
+    if not await _company_exists(session, company_id):
+        raise LookupError(f"Unknown company: {company_id}")
+    return False
+
+
+async def _apply_success_health(
+    session: AsyncSession,
+    company_id: UUID,
+    health: SourceHealthUpdate,
+) -> None:
+    record = await session.get(CompanyRecord, str(company_id))
+    if record is None:
+        raise LookupError(f"Unknown company: {company_id}")
+    record.last_job_count = health.job_count
+    if record.last_checked_at is None or record.last_checked_at <= health.checked_at:
+        record.last_checked_at = health.checked_at
+        record.last_status = health.status.value
+        record.last_error_category = health.error_category
+        record.updated_at = health.checked_at
 
 
 class SQLAlchemyCompanyRepository:
@@ -370,21 +504,81 @@ class SQLAlchemyCompanyRepository:
         self,
         company_id: UUID,
         update: SourceHealthUpdate,
-    ) -> None:
+    ) -> bool:
+        values: dict[str, object] = {
+            "last_checked_at": update.checked_at,
+            "last_status": update.status.value,
+            "last_error_category": update.error_category,
+            "updated_at": update.checked_at,
+        }
+        if update.status in (
+            SourceHealthStatus.HEALTHY,
+            SourceHealthStatus.EMPTY,
+        ):
+            values["last_success_at"] = update.checked_at
+            values["last_job_count"] = update.job_count
         async with self._session_factory() as session, session.begin():
-            record = await session.get(CompanyRecord, str(company_id))
-            if record is None:
+            statement = (
+                sqlalchemy_update(CompanyRecord)
+                .where(
+                    CompanyRecord.id == str(company_id),
+                    or_(
+                        CompanyRecord.last_checked_at.is_(None),
+                        CompanyRecord.last_checked_at < update.checked_at,
+                    ),
+                )
+                .values(**values)
+                .returning(CompanyRecord.id)
+            )
+            if await session.scalar(statement) is not None:
+                return True
+            if not await _company_exists(session, company_id):
                 raise LookupError(f"Unknown company: {company_id}")
-            record.last_checked_at = update.checked_at
-            record.last_status = update.status.value
-            record.last_error_category = update.error_category
-            record.updated_at = update.checked_at
-            if update.status in (
-                SourceHealthStatus.HEALTHY,
-                SourceHealthStatus.EMPTY,
-            ):
-                record.last_success_at = update.checked_at
-                record.last_job_count = update.job_count
+            return False
+
+
+class SQLAlchemyCollectionPersistence:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        self._session_factory = session_factory
+
+    async def persist_collection(
+        self,
+        company_id: UUID,
+        result: SourceCollectionResult,
+        health: SourceHealthUpdate,
+    ) -> CollectionPersistenceResult:
+        if health.status not in (
+            SourceHealthStatus.HEALTHY,
+            SourceHealthStatus.EMPTY,
+        ):
+            raise ValueError("successful collection health must be healthy or empty")
+        if health.error_category is not None:
+            raise ValueError("successful collection health cannot contain an error")
+        if health.job_count != len(result.vacancies):
+            raise ValueError("collection health job count must match vacancies")
+        if any(vacancy.company_id != company_id for vacancy in result.vacancies):
+            raise ValueError("all vacancies must belong to the collected company")
+
+        async with self._session_factory() as session, session.begin():
+            applied = await _claim_collection_success(
+                session,
+                company_id,
+                health.checked_at,
+            )
+            if not applied:
+                return CollectionPersistenceResult(
+                    applied=False,
+                    vacancy_upsert=VacancyUpsertResult(created=0, updated=0),
+                )
+            upserted = await _upsert_vacancies(session, result.vacancies)
+            await _apply_success_health(session, company_id, health)
+            return CollectionPersistenceResult(
+                applied=True,
+                vacancy_upsert=upserted,
+            )
 
 
 class SQLAlchemyVacancyRepository:
@@ -426,101 +620,8 @@ class SQLAlchemyVacancyRepository:
         self,
         vacancies: Sequence[JobVacancy],
     ) -> VacancyUpsertResult:
-        created = 0
-        updated = 0
-        observations_created = 0
-        cross_source_duplicates_collapsed = 0
         async with self._session_factory() as session, session.begin():
-            for vacancy in vacancies:
-                canonical_url = vacancy.canonical_url or normalize_canonical_url(
-                    vacancy.url
-                )
-                source_statement = select(VacancyObservationRecord).where(
-                    VacancyObservationRecord.source_company_id
-                    == str(vacancy.company_id),
-                    VacancyObservationRecord.discovered_via == vacancy.source.value,
-                    VacancyObservationRecord.source_job_id == vacancy.source_job_id,
-                )
-                observation = await session.scalar(source_statement)
-                if observation is not None:
-                    record = await session.get(
-                        JobVacancyRecord,
-                        observation.vacancy_id,
-                    )
-                    if record is None:
-                        raise LookupError(
-                            f"Observation points to missing vacancy: {observation.id}"
-                        )
-                    observation.observation_url = vacancy.url
-                    observation.canonical_url = canonical_url
-                    observation.original_reference = extract_original_reference(
-                        vacancy.url
-                    )
-                    observation.original_source = (
-                        vacancy.original_source or vacancy.source
-                    ).value
-                    observation.employer_name = vacancy.employer_name
-                    observation.title = vacancy.title
-                    observation.work_location = vacancy.work_location
-                    observation.last_seen_at = vacancy.last_seen_at
-                    observation.status = vacancy.status.value
-                    observation.closed_at = vacancy.closed_at
-                    if (
-                        record.source == vacancy.source.value
-                        and record.source_job_id == vacancy.source_job_id
-                    ):
-                        _update_canonical_record(record, vacancy, canonical_url)
-                    updated += 1
-                    continue
-
-                original_reference = extract_original_reference(vacancy.url)
-                identity_conditions = [
-                    VacancyObservationRecord.canonical_url == canonical_url
-                ]
-                if original_reference is not None:
-                    identity_conditions.append(
-                        VacancyObservationRecord.original_reference
-                        == original_reference
-                    )
-                matching_observation = await session.scalar(
-                    select(VacancyObservationRecord)
-                    .where(or_(*identity_conditions))
-                    .order_by(VacancyObservationRecord.first_seen_at)
-                )
-                if matching_observation is None:
-                    record = _vacancy_to_record(vacancy)
-                    session.add(record)
-                    await session.flush()
-                    session.add(_new_observation(vacancy, record.id, canonical_url))
-                    created += 1
-                    observations_created += 1
-                    continue
-
-                record = await session.get(
-                    JobVacancyRecord,
-                    matching_observation.vacancy_id,
-                )
-                if record is None:
-                    raise LookupError(
-                        "Canonical observation points to a missing vacancy"
-                    )
-                session.add(_new_observation(vacancy, record.id, canonical_url))
-                observations_created += 1
-                cross_source_duplicates_collapsed += int(
-                    matching_observation.discovered_via != vacancy.source.value
-                )
-                if source_trust_rank(vacancy.source) > source_trust_rank(
-                    VacancySource(record.source)
-                ):
-                    _update_canonical_record(record, vacancy, canonical_url)
-                updated += 1
-
-        return VacancyUpsertResult(
-            created=created,
-            updated=updated,
-            observations_created=observations_created,
-            cross_source_duplicates_collapsed=cross_source_duplicates_collapsed,
-        )
+            return await _upsert_vacancies(session, vacancies)
 
     async def list_active(self) -> Sequence[JobVacancy]:
         async with self._session_factory() as session:

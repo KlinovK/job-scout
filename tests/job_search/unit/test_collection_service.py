@@ -11,6 +11,7 @@ from job_search.application.errors import (
 )
 from job_search.application.models import (
     CollectionCoverage,
+    CollectionPersistenceResult,
     SourceCollectionResult,
     SourceHealthUpdate,
     VacancyUpsertResult,
@@ -61,9 +62,10 @@ class FakeCompanyRepository:
         self,
         company_id: UUID,
         update: SourceHealthUpdate,
-    ) -> None:
+    ) -> bool:
         self.checked.append((company_id, update.checked_at))
         self.health_updates.append((company_id, update))
+        return True
 
 
 class FakeVacancyRepository:
@@ -101,6 +103,37 @@ class FakeVacancyRepository:
 
     async def list_active(self) -> Sequence[JobVacancy]:
         return tuple(self.items.values())
+
+
+class FakeCollectionPersistence:
+    def __init__(
+        self,
+        companies: FakeCompanyRepository,
+        vacancies: FakeVacancyRepository,
+    ) -> None:
+        self.companies = companies
+        self.vacancies = vacancies
+
+    async def persist_collection(
+        self,
+        company_id: UUID,
+        result: SourceCollectionResult,
+        health: SourceHealthUpdate,
+    ) -> CollectionPersistenceResult:
+        upserted = await self.vacancies.upsert_many(result.vacancies)
+        await self.companies.update_health(company_id, health)
+        return CollectionPersistenceResult(applied=True, vacancy_upsert=upserted)
+
+
+class FailingCollectionPersistence:
+    async def persist_collection(
+        self,
+        company_id: UUID,
+        result: SourceCollectionResult,
+        health: SourceHealthUpdate,
+    ) -> CollectionPersistenceResult:
+        del company_id, result, health
+        raise RuntimeError("database unavailable")
 
 
 class FakeSource:
@@ -212,7 +245,7 @@ async def test_collects_one_company_and_marks_it_checked() -> None:
     source = FakeSource({company.id: [make_vacancy(company.id)]})
     service = CollectJobsService(
         companies,
-        vacancies,
+        FakeCollectionPersistence(companies, vacancies),
         FakeProvider({ATSType.GREENHOUSE: source}),
         clock=lambda: NOW,
     )
@@ -237,7 +270,7 @@ async def test_repeated_collection_updates_instead_of_duplicating() -> None:
     source = FakeSource({company.id: [make_vacancy(company.id)]})
     service = CollectJobsService(
         companies,
-        vacancies,
+        FakeCollectionPersistence(companies, vacancies),
         FakeProvider({ATSType.GREENHOUSE: source}),
         clock=lambda: NOW,
     )
@@ -271,7 +304,7 @@ async def test_one_company_failure_does_not_stop_another() -> None:
 
     summary = await CollectJobsService(
         companies,
-        vacancies,
+        FakeCollectionPersistence(companies, vacancies),
         provider,
         clock=lambda: NOW,
     ).collect()
@@ -285,12 +318,34 @@ async def test_one_company_failure_does_not_stop_another() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persistence_failure_is_reported_separately_from_source_failure() -> None:
+    company = make_company()
+    companies = FakeCompanyRepository([company])
+    source = FakeSource({company.id: [make_vacancy(company.id)]})
+
+    summary = await CollectJobsService(
+        companies,
+        FailingCollectionPersistence(),
+        FakeProvider({ATSType.GREENHOUSE: source}),
+        clock=lambda: NOW,
+    ).collect()
+
+    health = companies.health_updates[0][1]
+    assert summary.failure_count == 1
+    assert summary.jobs_fetched == 0
+    assert summary.failures[0].error_category == "persistence:RuntimeError"
+    assert health.status is SourceHealthStatus.FAILED
+    assert health.error_category == "persistence:RuntimeError"
+
+
+@pytest.mark.asyncio
 async def test_unsupported_source_is_reported() -> None:
     company = make_company(ats_type=ATSType.LEVER)
     companies = FakeCompanyRepository([company])
+    vacancies = FakeVacancyRepository()
     summary = await CollectJobsService(
         companies,
-        FakeVacancyRepository(),
+        FakeCollectionPersistence(companies, vacancies),
         FakeProvider({}),
         clock=lambda: NOW,
     ).collect()
@@ -312,10 +367,11 @@ async def test_empty_and_invalid_sources_have_distinct_health() -> None:
         ats_identifier="invalid",
     )
     companies = FakeCompanyRepository([empty, invalid])
+    vacancies = FakeVacancyRepository()
 
     summary = await CollectJobsService(
         companies,
-        FakeVacancyRepository(),
+        FakeCollectionPersistence(companies, vacancies),
         FakeProvider(
             {
                 ATSType.LEVER: FakeSource({}),
@@ -338,10 +394,11 @@ async def test_empty_and_invalid_sources_have_distinct_health() -> None:
 async def test_all_malformed_provider_data_is_failed_not_empty() -> None:
     company = make_company()
     companies = FakeCompanyRepository([company])
+    vacancies = FakeVacancyRepository()
 
     summary = await CollectJobsService(
         companies,
-        FakeVacancyRepository(),
+        FakeCollectionPersistence(companies, vacancies),
         FakeProvider({ATSType.GREENHOUSE: AllMalformedSource()}),
         clock=lambda: NOW,
     ).collect()
@@ -373,7 +430,7 @@ async def test_incomplete_mixed_result_preserves_current_persistence_and_health(
 
     summary = await CollectJobsService(
         companies,
-        vacancies,
+        FakeCollectionPersistence(companies, vacancies),
         FakeProvider({ATSType.GREENHOUSE: StaticResultSource(result)}),
         clock=lambda: NOW,
     ).collect()
@@ -393,9 +450,11 @@ async def test_provider_summary_keeps_provider_counts_separate() -> None:
         ats_type=ATSType.LEVER,
         ats_identifier="lever",
     )
+    companies = FakeCompanyRepository([greenhouse, lever])
+    vacancies = FakeVacancyRepository()
     summary = await CollectJobsService(
-        FakeCompanyRepository([greenhouse, lever]),
-        FakeVacancyRepository(),
+        companies,
+        FakeCollectionPersistence(companies, vacancies),
         FakeProvider(
             {
                 ATSType.GREENHOUSE: FakeSource(
@@ -423,10 +482,12 @@ async def test_explicit_external_collection_can_include_disabled_source() -> Non
         enabled=False,
     )
     source = FakeSource({hh.id: [make_vacancy(hh.id)]})
+    companies = FakeCompanyRepository([hh])
+    vacancies = FakeVacancyRepository()
 
     summary = await CollectJobsService(
-        FakeCompanyRepository([hh]),
-        FakeVacancyRepository(),
+        companies,
+        FakeCollectionPersistence(companies, vacancies),
         FakeProvider({ATSType.HH: source}),
         clock=lambda: NOW,
     ).collect((ATSType.HH,), include_disabled=True)
@@ -437,15 +498,17 @@ async def test_explicit_external_collection_can_include_disabled_source() -> Non
 
 @pytest.mark.asyncio
 async def test_collection_concurrency_is_bounded() -> None:
-    companies = [
+    configured_companies = [
         make_company(name=f"Company {index}", ats_identifier=f"company-{index}")
         for index in range(5)
     ]
     source = ConcurrencyTrackingSource(release_at=2)
+    companies = FakeCompanyRepository(configured_companies)
+    vacancies = FakeVacancyRepository()
 
     summary = await CollectJobsService(
-        FakeCompanyRepository(companies),
-        FakeVacancyRepository(),
+        companies,
+        FakeCollectionPersistence(companies, vacancies),
         FakeProvider({ATSType.GREENHOUSE: source}),
         clock=lambda: NOW,
         max_concurrency=2,
@@ -457,10 +520,12 @@ async def test_collection_concurrency_is_bounded() -> None:
 
 
 def test_non_positive_collection_concurrency_is_rejected() -> None:
+    companies = FakeCompanyRepository([])
+    vacancies = FakeVacancyRepository()
     with pytest.raises(ValueError, match="max_concurrency"):
         CollectJobsService(
-            FakeCompanyRepository([]),
-            FakeVacancyRepository(),
+            companies,
+            FakeCollectionPersistence(companies, vacancies),
             FakeProvider({}),
             max_concurrency=0,
         )

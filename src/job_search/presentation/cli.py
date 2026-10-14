@@ -23,6 +23,7 @@ from job_search.infrastructure.persistence.sqlalchemy.database import (
 )
 from job_search.infrastructure.persistence.sqlalchemy.repositories import (
     SQLAlchemyClassificationRepository,
+    SQLAlchemyCollectionPersistence,
     SQLAlchemyCompanyRepository,
     SQLAlchemyVacancyRepository,
 )
@@ -119,6 +120,7 @@ async def _run(
     companies = SQLAlchemyCompanyRepository(session_factory)
     vacancies = SQLAlchemyVacancyRepository(session_factory)
     classifications = SQLAlchemyClassificationRepository(session_factory)
+    collection_persistence = SQLAlchemyCollectionPersistence(session_factory)
 
     try:
         if command == "seed":
@@ -334,7 +336,7 @@ async def _run(
             )
             collection_service = CollectJobsService(
                 companies,
-                vacancies,
+                collection_persistence,
                 provider,
                 max_concurrency=settings.collection_concurrency,
             )

@@ -42,6 +42,10 @@ opaque score.
 - **Idempotent persistence:** repeated registry imports, collections, and
   `ios-v1` classifications update existing identities instead of creating
   duplicate records.
+- **Atomic collection persistence:** each successful company/source result
+  commits canonical vacancies, source observations, ownership, and success
+  health metadata in one transaction. A failed write rolls the whole unit
+  back, while older or replayed results cannot overwrite newer persisted data.
 - **Explainable iOS classification:** a deterministic, versioned ruleset emits
   `MATCH`, `POSSIBLE_MATCH`, or `REJECT` with structured signals, warnings, and
   rejection reasons.
@@ -92,9 +96,9 @@ inside the persistence adapter.
 The implemented collection path is:
 
 ```text
-Public APIs -> source adapters -> CollectJobsService -> repositories -> SQLite
-                                                        |
-                                                        +-> source health
+Public APIs -> source adapters -> CollectJobsService -> atomic persistence -> SQLite
+                                                               |
+                                                               +-> source health
 SQLite -> ios-v1 classifier -> persisted decisions -> CLI candidate view
 ```
 
@@ -126,9 +130,23 @@ This prevents upstream schema drift from silently looking like â€œno vacancies.â
 ### Bounded concurrency with isolated failures
 
 HTTP collection runs concurrently behind an `asyncio.Semaphore`, while SQLite
-writes use a short application-level lock. This keeps network I/O efficient,
-avoids SQLite writer contention, and records per-company failures without
-cancelling unrelated work.
+writes use a short application-level lock. No network request is held inside a
+database transaction. A conditional database update orders each company's
+successful results by collection start time, so correctness does not depend on
+the in-process lock alone. This keeps network I/O efficient, avoids unnecessary
+SQLite writer contention, and records per-company failures without cancelling
+unrelated work.
+
+### Atomic collection persistence
+
+A completed result for one company/source is the transaction boundary.
+Canonical vacancies, source observations, ownership, and successful source
+health commit together or roll back together. Persistence failures are reported
+separately from source API failures. Exact replays are no-ops, older results are
+rejected at the database write boundary, and existing lifecycle state is not
+reset by collection upserts. Incomplete results may still retain their valid
+records, but they do not advance `last_complete_snapshot_at`; missing-vacancy
+reconciliation remains future work.
 
 ### Explicit retry ownership
 
@@ -164,7 +182,7 @@ any database write.
 
 ## Quality
 
-The current repository contains **253 passing tests**, including unit,
+The current repository contains **263 passing tests**, including unit,
 integration, migration, adapter-contract, canonicalization, concurrency, and
 classification regression coverage.
 
@@ -185,14 +203,14 @@ There is no CI badge because CI has not been implemented yet.
 
 - six HTTP source adapters and a validated 92-entry registry;
 - async normalized collection with bounded concurrency and provider isolation;
-- async SQLite persistence and Alembic migrations;
+- atomic async SQLite collection persistence and Alembic migrations;
 - source observations, conservative cross-source canonicalization, and
   duplicate diagnostics;
 - persisted source-health and malformed-source semantics;
 - bounded retry/backoff for safe GET source operations;
 - deterministic `ios-v1` classification and candidate inspection;
 - a separate Telegram-to-Saved-Messages collection path;
-- strict static analysis and a 229-test automated suite.
+- strict static analysis and a 263-test automated suite.
 
 ### In Progress / Next
 

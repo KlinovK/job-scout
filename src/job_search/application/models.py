@@ -58,6 +58,12 @@ class VacancyUpsertResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CollectionPersistenceResult:
+    applied: bool
+    vacancy_upsert: VacancyUpsertResult
+
+
+@dataclass(frozen=True, slots=True)
 class CompanySeedResult:
     created: int
     updated: int
