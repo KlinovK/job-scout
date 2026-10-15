@@ -46,6 +46,9 @@ opaque score.
   commits canonical vacancies, source observations, ownership, and success
   health metadata in one transaction. A failed write rolls the whole unit
   back, while older or replayed results cannot overwrite newer persisted data.
+- **Safe observation reconciliation:** authoritative complete snapshots close
+  an observation only after two consecutive misses and reopen it when it
+  reappears. Incomplete and rolling-window results never drive lifecycle state.
 - **Explainable iOS classification:** a deterministic, versioned ruleset emits
   `MATCH`, `POSSIBLE_MATCH`, or `REJECT` with structured signals, warnings, and
   rejection reasons.
@@ -144,9 +147,21 @@ Canonical vacancies, source observations, ownership, and successful source
 health commit together or roll back together. Persistence failures are reported
 separately from source API failures. Exact replays are no-ops, older results are
 rejected at the database write boundary, and existing lifecycle state is not
-reset by collection upserts. Incomplete results may still retain their valid
-records, but they do not advance `last_complete_snapshot_at`; missing-vacancy
-reconciliation remains future work.
+reset by non-authoritative collection upserts.
+
+### Authoritative observation reconciliation
+
+Only a reconciliation-eligible `FULL_BOARD` result can advance
+`last_complete_snapshot_at`. One missing complete snapshot increments an active
+observation's counter; the second closes it and records that snapshot's time.
+The counter then remains bounded at two. Reappearance in a later authoritative
+snapshot reactivates the observation and clears its counter and closure time.
+Incomplete, malformed, filtered, and rolling-window results—including hh.ru
+and AgileFluent searches—cannot increment, close, reopen, or advance complete
+snapshot metadata. Replays and stale snapshots are rejected before lifecycle
+updates. Canonical vacancy status is deliberately not derived from observation
+status yet, so one disappearing source cannot close a vacancy still supported
+by another source.
 
 ### Explicit retry ownership
 
@@ -182,7 +197,7 @@ any database write.
 
 ## Quality
 
-The current repository contains **263 passing tests**, including unit,
+The current repository contains **289 passing tests**, including unit,
 integration, migration, adapter-contract, canonicalization, concurrency, and
 classification regression coverage.
 
@@ -206,15 +221,16 @@ There is no CI badge because CI has not been implemented yet.
 - atomic async SQLite collection persistence and Alembic migrations;
 - source observations, conservative cross-source canonicalization, and
   duplicate diagnostics;
+- two-snapshot, authoritative observation reconciliation with safe reopening;
 - persisted source-health and malformed-source semantics;
 - bounded retry/backoff for safe GET source operations;
 - deterministic `ios-v1` classification and candidate inspection;
 - a separate Telegram-to-Saved-Messages collection path;
-- strict static analysis and a 263-test automated suite.
+- strict static analysis and a 289-test automated suite.
 
 ### In Progress / Next
 
-- vacancy lifecycle reconciliation when roles disappear from a source;
+- canonical vacancy lifecycle aggregation over source observations;
 - a query layer over normalized vacancies and classifications;
 - operational hardening of scheduled collection and local runtime security.
 

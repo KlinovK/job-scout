@@ -102,7 +102,7 @@ async def test_successful_collection_commits_vacancies_observations_and_health(
     assert stored.last_success_at == NOW
     assert stored.last_job_count == 2
     assert stored.last_status is SourceHealthStatus.HEALTHY
-    assert stored.last_complete_snapshot_at is None
+    assert stored.last_complete_snapshot_at == NOW
     async with session_factory() as session:
         owners = set(
             await session.scalars(select(VacancyObservationRecord.source_company_id))
@@ -198,14 +198,16 @@ async def test_failure_during_success_health_update_rolls_back_everything(
 
 
 @pytest.mark.asyncio
-async def test_replay_is_idempotent_and_preserves_lifecycle_state(database) -> None:
+async def test_incomplete_replay_is_idempotent_and_preserves_lifecycle_state(
+    database,
+) -> None:
     _, session_factory = database
     companies = SQLAlchemyCompanyRepository(session_factory)
     vacancies = SQLAlchemyVacancyRepository(session_factory)
     persistence = SQLAlchemyCollectionPersistence(session_factory)
     company = make_company()
     vacancy = make_vacancy(company.id)
-    result = _result((vacancy,))
+    result = _result((vacancy,), complete=False)
     await companies.add(company)
 
     first = await persistence.persist_collection(

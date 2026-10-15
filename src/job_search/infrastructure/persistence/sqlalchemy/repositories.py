@@ -50,6 +50,8 @@ from job_search.infrastructure.persistence.sqlalchemy.models import (
     VacancyObservationRecord,
 )
 
+_MISSING_SNAPSHOTS_TO_CLOSE = 2
+
 
 def _encode_enum_values(values: Sequence[StrEnum]) -> str:
     return ",".join(value.value for value in values)
@@ -379,16 +381,25 @@ async def _claim_collection_success(
     session: AsyncSession,
     company_id: UUID,
     checked_at: datetime,
+    *,
+    complete_snapshot: bool,
 ) -> bool:
+    ordering_conditions = [
+        or_(
+            CompanyRecord.last_success_at.is_(None),
+            CompanyRecord.last_success_at < checked_at,
+        )
+    ]
+    if complete_snapshot:
+        ordering_conditions.append(
+            or_(
+                CompanyRecord.last_complete_snapshot_at.is_(None),
+                CompanyRecord.last_complete_snapshot_at < checked_at,
+            )
+        )
     statement = (
         sqlalchemy_update(CompanyRecord)
-        .where(
-            CompanyRecord.id == str(company_id),
-            or_(
-                CompanyRecord.last_success_at.is_(None),
-                CompanyRecord.last_success_at < checked_at,
-            ),
-        )
+        .where(CompanyRecord.id == str(company_id), *ordering_conditions)
         .values(last_success_at=checked_at)
         .returning(CompanyRecord.id)
     )
@@ -397,6 +408,59 @@ async def _claim_collection_success(
     if not await _company_exists(session, company_id):
         raise LookupError(f"Unknown company: {company_id}")
     return False
+
+
+def _mark_observation_missing(
+    observation: VacancyObservationRecord,
+    snapshot_at: datetime,
+) -> None:
+    if observation.status == VacancyStatus.CLOSED.value:
+        observation.missing_complete_snapshots = _MISSING_SNAPSHOTS_TO_CLOSE
+        return
+    observation.missing_complete_snapshots = min(
+        observation.missing_complete_snapshots + 1,
+        _MISSING_SNAPSHOTS_TO_CLOSE,
+    )
+    if observation.missing_complete_snapshots == _MISSING_SNAPSHOTS_TO_CLOSE:
+        observation.status = VacancyStatus.CLOSED.value
+        observation.closed_at = snapshot_at
+
+
+def _mark_observation_present(observation: VacancyObservationRecord) -> None:
+    observation.status = VacancyStatus.ACTIVE.value
+    observation.closed_at = None
+    observation.missing_complete_snapshots = 0
+
+
+async def _reconcile_observations(
+    session: AsyncSession,
+    company_id: UUID,
+    source: str,
+    present_source_job_ids: set[str],
+    snapshot_at: datetime,
+) -> None:
+    statement = select(VacancyObservationRecord).where(
+        VacancyObservationRecord.source_company_id == str(company_id),
+        VacancyObservationRecord.discovered_via == source,
+    )
+    observations = (await session.scalars(statement)).all()
+    for observation in observations:
+        if observation.source_job_id in present_source_job_ids:
+            _mark_observation_present(observation)
+            continue
+        _mark_observation_missing(observation, snapshot_at)
+
+
+def _advance_complete_snapshot(
+    company: CompanyRecord,
+    snapshot_at: datetime,
+) -> None:
+    if (
+        company.last_complete_snapshot_at is not None
+        and company.last_complete_snapshot_at >= snapshot_at
+    ):
+        raise ValueError("complete snapshot timestamp must advance monotonically")
+    company.last_complete_snapshot_at = snapshot_at
 
 
 async def _apply_success_health(
@@ -567,13 +631,31 @@ class SQLAlchemyCollectionPersistence:
                 session,
                 company_id,
                 health.checked_at,
+                complete_snapshot=result.reconciliation_eligible,
             )
             if not applied:
                 return CollectionPersistenceResult(
                     applied=False,
                     vacancy_upsert=VacancyUpsertResult(created=0, updated=0),
                 )
+            company = await session.get(CompanyRecord, str(company_id))
+            if company is None:
+                raise LookupError(f"Unknown company: {company_id}")
+            source = company.ats_type
+            if any(vacancy.source.value != source for vacancy in result.vacancies):
+                raise ValueError(
+                    "all vacancies must match the collected company source"
+                )
             upserted = await _upsert_vacancies(session, result.vacancies)
+            if result.reconciliation_eligible:
+                await _reconcile_observations(
+                    session,
+                    company_id,
+                    source,
+                    {vacancy.source_job_id for vacancy in result.vacancies},
+                    health.checked_at,
+                )
+                _advance_complete_snapshot(company, health.checked_at)
             await _apply_success_health(session, company_id, health)
             return CollectionPersistenceResult(
                 applied=True,
