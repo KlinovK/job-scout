@@ -9,6 +9,7 @@ JobScout is production-oriented software; generated changes require the same rev
 - Read `.ai/architecture.md` for production, data, service, adapter, or boundary changes.
 - Read `.ai/testing.md` before choosing or reporting verification.
 - Read `.ai/review.md` for implementation reviews and before declaring code ready.
+- Consult `docs/engineering/quality-standards.md` when planning verification and assessing commit readiness.
 - Read `.ai/learning.md` when the task includes an explanation or learning objective.
 - Inspect the relevant code and tests; documentation is guidance, not a substitute for evidence.
 
@@ -67,4 +68,5 @@ JobScout is production-oriented software; generated changes require the same rev
 - Test strategy and commands: `.ai/testing.md`
 - Adversarial review protocol: `.ai/review.md`
 - Learning protocol: `.ai/learning.md`
+- Engineering quality checklist: `docs/engineering/quality-standards.md`
 - Product and operator overview: `README.md`

@@ -22,6 +22,21 @@ git diff --check
 
 Ruff enforces linting and formatting, mypy checks `src/job_search` in strict mode, and pytest runs the configured suite. Formatting with `.venv/bin/ruff format .` mutates files and should be used only within the approved scope.
 
+## Read-Only Review Mode
+
+`make quality` must not be described as read-only. Its current commands do not intentionally rewrite source files, but mypy and pytest may create caches or test artifacts, and individual tests may have additional side effects. Inspect the applicable tests and tool configuration before running them in a read-only review.
+
+When verification must avoid repository writes, contain known tool output in a new temporary directory and disable optional caches where supported. For example, after creating a unique temporary directory outside the repository:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/ruff check --no-cache .
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/ruff format --check .
+.venv/bin/mypy --cache-dir /private/tmp/jobscout-review-UNIQUE/mypy
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -p no:cacheprovider --basetemp=/private/tmp/jobscout-review-UNIQUE/pytest
+```
+
+Replace `UNIQUE` with a newly created, task-specific path. `PYTHONDONTWRITEBYTECODE=1` or `python -B` suppresses Python bytecode generation only; it does not make arbitrary tests side-effect-free. Tests may still create temporary files, logs, databases, caches, or external effects. Use synthetic data and isolated temporary databases, never the real database, credentials, sessions, or external services. Verification that cannot be safely contained requires explicit authorization, and every observed side effect must be disclosed.
+
 ## Focused Tests
 
 Run the smallest relevant node or file during implementation, for example:
@@ -68,3 +83,15 @@ Classify every requested check accurately:
 - **Blocked:** attempted or required, but an external condition prevented completion.
 
 Do not describe skipped, unavailable, or blocked checks as passing. If a required gate fails, stop delivery unless the task explicitly asks for diagnosis or remediation.
+
+## Whitespace Coverage
+
+`git diff --check` checks unstaged changes to tracked files; it does not inspect untracked files or the staged diff. Review all three states as applicable:
+
+```bash
+git diff --check
+git diff --cached --check
+git diff --no-index --check /dev/null path/to/untracked-file
+```
+
+Run the no-index command separately for each newly created untracked file. Exit status `1` can mean only that the files differ, which is expected for a new file; a nonzero status alone does not prove a whitespace defect. Inspect the command's actual whitespace diagnostics. Once a new file is staged, `git diff --cached --check` covers it.

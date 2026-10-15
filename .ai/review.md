@@ -22,6 +22,14 @@ Severity describes impact, not effort.
 7. Check that documentation and commands describe the implemented state.
 8. Re-run affected tests after any remediation.
 
+## Read-Only Reviews
+
+A read-only reviewer must not intentionally modify source files, other tracked files, the Git index, or external state. Before executing a verification command, inspect its configuration and expected filesystem effects. Commands that may write require containment in an isolated temporary location or explicit authorization.
+
+Using `python -B` or `PYTHONDONTWRITEBYTECODE=1` prevents bytecode generation but does not make a test suite read-only. Pytest, mypy, and individual tests may still create caches, temporary files, logs, or databases. Follow the containment guidance in `.ai/testing.md`, never use real databases, credentials, sessions, or external services, and disclose every verification side effect that occurs.
+
+For whitespace review, consider each Git state. `git diff --check` covers unstaged tracked changes, `git diff --cached --check` covers staged changes, and neither covers untracked files. Check each new untracked file with `git diff --no-index --check /dev/null <file>`. Exit status `1` may indicate the expected ordinary file difference; determine failure from the emitted whitespace diagnostics, not from nonzero status alone.
+
 ## JobScout-Specific Checks
 
 - Is a provider failure still distinct from an authoritative empty snapshot?

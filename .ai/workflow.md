@@ -23,6 +23,12 @@ The plan should name:
 
 Do not use planning as permission to expand scope.
 
+### Risk precedence
+
+When an applicable task or repository policy classifies work as Lightweight, Standard, or High Risk, the highest applicable level governs. High Risk supersedes Standard and Lightweight, and a small diff does not lower its classification. Financial, security, persistence, and other high-risk changes retain every verification and human-review gate required by the governing policy. Documentation-only work is not automatically Lightweight when it changes mandatory safety or engineering policy.
+
+This rule resolves precedence only. It does not invent classification criteria or replace explicit approval requirements from the governing task or policy.
+
 ## 3. Implement
 
 - Make the smallest coherent change.
