@@ -52,6 +52,8 @@ def make_vacancy(
     source: VacancySource = VacancySource.GREENHOUSE,
     url: str | None = None,
     original_source: VacancySource | None = None,
+    status: VacancyStatus = VacancyStatus.ACTIVE,
+    closed_at: datetime | None = None,
 ) -> JobVacancy:
     return JobVacancy(
         id=vacancy_id or uuid4(),
@@ -67,7 +69,8 @@ def make_vacancy(
         published_at=None,
         first_seen_at=first_seen_at,
         last_seen_at=last_seen_at,
-        status=VacancyStatus.ACTIVE,
+        status=status,
         employer_name=employer_name,
         original_source=original_source,
+        closed_at=closed_at,
     )

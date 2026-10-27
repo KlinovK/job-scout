@@ -105,6 +105,14 @@ class ClassificationRepository(Protocol):
         limit: int | None = None,
     ) -> Sequence[VacancyClassification]: ...
 
+    async def list_active_by_decisions(
+        self,
+        classifier_version: str,
+        decisions: Sequence[ClassificationDecision],
+        *,
+        limit: int | None = None,
+    ) -> Sequence[VacancyClassification]: ...
+
 
 class VacancyClassifier(Protocol):
     version: str

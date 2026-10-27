@@ -219,6 +219,11 @@ async def _run(
             )
             print(f"Canonical: {employer} | {canonical.title}")
             print(f"Preferred source: {canonical.source.value}")
+            print(f"Canonical status: {canonical.status.value}")
+            print(
+                "Canonical closed at: "
+                f"{canonical.closed_at.isoformat() if canonical.closed_at else '-'}"
+            )
             for observation in await vacancies.list_observations(vacancy_id):
                 original = (
                     observation.original_source.value
@@ -229,6 +234,18 @@ async def _run(
                 print(f"Discovered via: {observation.discovered_via.value}")
                 print(f"Source job ID: {observation.source_job_id}")
                 print(f"Original source: {original}")
+                print(
+                    f"Source company ID: {observation.source_company_id or 'unknown'}"
+                )
+                print(f"Observation status: {observation.status.value}")
+                observation_closed_at = (
+                    observation.closed_at.isoformat() if observation.closed_at else "-"
+                )
+                print(f"Observation closed at: {observation_closed_at}")
+                print(
+                    "Missing complete snapshots: "
+                    f"{observation.missing_complete_snapshots}"
+                )
                 print(f"URL: {observation.observation_url}")
             return 0
 

@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 
@@ -112,10 +113,14 @@ async def test_first_missing_authoritative_snapshot_increments_without_closing(
     await _persist(persistence, company, _result(), T1)
 
     observation = await _only_observation(vacancies, vacancy.id)
+    canonical = await vacancies.get(vacancy.id)
     stored_company = await companies.get(company.id)
     assert observation.status is VacancyStatus.ACTIVE
     assert observation.missing_complete_snapshots == 1
     assert observation.closed_at is None
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert canonical.closed_at is None
     assert stored_company is not None
     assert stored_company.last_complete_snapshot_at == T1
 
@@ -137,10 +142,14 @@ async def test_second_missing_authoritative_snapshot_closes_observation(
     await _persist(persistence, company, _result(), T2)
 
     observation = await _only_observation(vacancies, vacancy.id)
+    canonical = await vacancies.get(vacancy.id)
     stored_company = await companies.get(company.id)
     assert observation.status is VacancyStatus.CLOSED
     assert observation.missing_complete_snapshots == 2
     assert observation.closed_at == T2
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+    assert canonical.closed_at == T2
     assert stored_company is not None
     assert stored_company.last_complete_snapshot_at == T2
 
@@ -158,9 +167,13 @@ async def test_repeated_missing_snapshot_preserves_closure_time_and_bounded_coun
     await _persist(persistence, company, _result(), T3)
 
     observation = await _only_observation(vacancies, vacancy.id)
+    canonical = await vacancies.get(vacancy.id)
     assert observation.status is VacancyStatus.CLOSED
     assert observation.missing_complete_snapshots == 2
     assert observation.closed_at == T2
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+    assert canonical.closed_at == T2
 
 
 @pytest.mark.asyncio
@@ -181,10 +194,14 @@ async def test_closed_observation_reopens_in_authoritative_snapshot(database) ->
     await _persist(persistence, company, _result((reappeared,)), T3)
 
     observation = await _only_observation(vacancies, vacancy.id)
+    canonical = await vacancies.get(vacancy.id)
     assert observation.status is VacancyStatus.ACTIVE
     assert observation.missing_complete_snapshots == 0
     assert observation.closed_at is None
     assert observation.title == "Reappeared"
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert canonical.closed_at is None
 
 
 @pytest.mark.asyncio
@@ -534,7 +551,109 @@ async def test_closing_one_observation_keeps_shared_canonical_vacancy_active(
 
 
 @pytest.mark.asyncio
-async def test_incomplete_reappearance_does_not_reopen_closed_observation(
+async def test_all_owned_trustworthy_observations_close_shared_canonical(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    greenhouse_company = make_company(name="Official", ats_identifier="official")
+    lever_company = make_company(
+        name="Mirror",
+        ats_type=ATSType.LEVER,
+        ats_identifier="mirror",
+    )
+    shared_url = "https://example.com/jobs/shared-closed"
+    greenhouse = make_vacancy(
+        greenhouse_company.id,
+        source_job_id="greenhouse-closed",
+        url=shared_url,
+    )
+    lever = make_vacancy(
+        lever_company.id,
+        source=VacancySource.LEVER,
+        source_job_id="lever-closed",
+        url=shared_url,
+    )
+    await companies.add(greenhouse_company)
+    await companies.add(lever_company)
+    await _persist(persistence, greenhouse_company, _result((greenhouse,)), T0)
+    await _persist(persistence, lever_company, _result((lever,)), T0)
+
+    await _persist(persistence, greenhouse_company, _result(), T1)
+    await _persist(persistence, greenhouse_company, _result(), T2)
+    after_one_source = await vacancies.get(greenhouse.id)
+    assert after_one_source is not None
+    assert after_one_source.status is VacancyStatus.ACTIVE
+
+    await _persist(persistence, lever_company, _result(), T1)
+    await _persist(persistence, lever_company, _result(), T2)
+
+    canonical = await vacancies.get(greenhouse.id)
+    observations = await vacancies.list_observations(greenhouse.id)
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+    assert canonical.closed_at == T2
+    assert {item.status for item in observations} == {VacancyStatus.CLOSED}
+    assert {item.closed_at for item in observations} == {T2}
+
+
+@pytest.mark.asyncio
+async def test_null_owned_observation_blocks_canonical_closure(database) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    official_company = make_company(name="Official", ats_identifier="official-null")
+    mirror_company = make_company(
+        name="Mirror",
+        ats_type=ATSType.LEVER,
+        ats_identifier="mirror-null",
+    )
+    shared_url = "https://example.com/jobs/shared-null"
+    official = make_vacancy(
+        official_company.id,
+        source_job_id="official-null",
+        url=shared_url,
+    )
+    mirror = make_vacancy(
+        mirror_company.id,
+        source=VacancySource.LEVER,
+        source_job_id="mirror-null",
+        url=shared_url,
+    )
+    await companies.add(official_company)
+    await companies.add(mirror_company)
+    await _persist(persistence, official_company, _result((official,)), T0)
+    await _persist(persistence, mirror_company, _result((mirror,)), T0)
+    async with session_factory() as session, session.begin():
+        unowned = await session.scalar(
+            select(VacancyObservationRecord).where(
+                VacancyObservationRecord.discovered_via
+                == VacancySource.GREENHOUSE.value
+            )
+        )
+        canonical = await session.get(JobVacancyRecord, str(official.id))
+        assert unowned is not None
+        assert canonical is not None
+        unowned.source_company_id = None
+        unowned.status = VacancyStatus.CLOSED.value
+        unowned.closed_at = T1
+        canonical.status = VacancyStatus.CLOSED.value
+        canonical.closed_at = T1
+
+    await _persist(persistence, mirror_company, _result(), T1)
+    await _persist(persistence, mirror_company, _result(), T2)
+
+    canonical = await vacancies.get(official.id)
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert canonical.closed_at is None
+
+
+@pytest.mark.asyncio
+async def test_incomplete_positive_row_reopens_closed_observation_and_canonical(
     database,
 ) -> None:
     _, _, vacancies, persistence, company, vacancy = await _setup_active_observation(
@@ -557,10 +676,148 @@ async def test_incomplete_reappearance_does_not_reopen_closed_observation(
     )
 
     observation = await _only_observation(vacancies, vacancy.id)
-    assert observation.status is VacancyStatus.CLOSED
-    assert observation.missing_complete_snapshots == 2
-    assert observation.closed_at == T2
+    canonical = await vacancies.get(vacancy.id)
+    assert observation.status is VacancyStatus.ACTIVE
+    assert observation.missing_complete_snapshots == 0
+    assert observation.closed_at is None
     assert observation.last_seen_at == T3
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert canonical.closed_at is None
+
+
+@pytest.mark.asyncio
+async def test_positive_closed_row_closes_observation_and_canonical(database) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    company = make_company(ats_type=ATSType.HH, ats_identifier="hh")
+    active = make_vacancy(
+        company.id,
+        source=VacancySource.HH,
+        source_job_id="hh-job",
+    )
+    closed = make_vacancy(
+        company.id,
+        vacancy_id=active.id,
+        source=VacancySource.HH,
+        source_job_id=active.source_job_id,
+        first_seen_at=T0,
+        last_seen_at=T1,
+        status=VacancyStatus.CLOSED,
+    )
+    await companies.add(company)
+    await _persist(
+        persistence,
+        company,
+        _result((active,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T0,
+    )
+
+    await _persist(
+        persistence,
+        company,
+        _result((closed,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T1,
+    )
+
+    observation = await _only_observation(vacancies, active.id)
+    canonical = await vacancies.get(active.id)
+    assert observation.status is VacancyStatus.CLOSED
+    assert observation.closed_at == T1
+    assert observation.missing_complete_snapshots == 0
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+    assert canonical.closed_at == T1
+
+    repeated = make_vacancy(
+        company.id,
+        vacancy_id=active.id,
+        source=VacancySource.HH,
+        source_job_id=active.source_job_id,
+        first_seen_at=T0,
+        last_seen_at=T2,
+        status=VacancyStatus.CLOSED,
+    )
+    await _persist(
+        persistence,
+        company,
+        _result((repeated,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T2,
+    )
+    repeated_observation = await _only_observation(vacancies, active.id)
+    repeated_canonical = await vacancies.get(active.id)
+    assert repeated_observation.closed_at == T1
+    assert repeated_canonical is not None
+    assert repeated_canonical.closed_at == T1
+
+
+@pytest.mark.asyncio
+async def test_rolling_window_positive_active_row_reopens_closed_vacancy(
+    database,
+) -> None:
+    _, _, vacancies, persistence, company, vacancy = await _setup_active_observation(
+        database
+    )
+    await _persist(persistence, company, _result(), T1)
+    await _persist(persistence, company, _result(), T2)
+    reappeared = make_vacancy(
+        company.id,
+        source_job_id=vacancy.source_job_id,
+        first_seen_at=T0,
+        last_seen_at=T3,
+    )
+
+    await _persist(
+        persistence,
+        company,
+        _result((reappeared,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T3,
+    )
+
+    observation = await _only_observation(vacancies, vacancy.id)
+    canonical = await vacancies.get(vacancy.id)
+    assert observation.status is VacancyStatus.ACTIVE
+    assert observation.closed_at is None
+    assert observation.missing_complete_snapshots == 0
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert canonical.closed_at is None
+
+
+@pytest.mark.asyncio
+async def test_reclosure_after_positive_reopening_uses_new_timestamp(database) -> None:
+    _, _, vacancies, persistence, company, vacancy = await _setup_active_observation(
+        database
+    )
+    await _persist(persistence, company, _result(), T1)
+    await _persist(persistence, company, _result(), T2)
+    reappeared = make_vacancy(
+        company.id,
+        source_job_id=vacancy.source_job_id,
+        first_seen_at=vacancy.first_seen_at,
+        last_seen_at=T3,
+    )
+    await _persist(
+        persistence,
+        company,
+        _result((reappeared,), complete=False),
+        T3,
+    )
+    t4 = T3 + timedelta(hours=1)
+    t5 = T3 + timedelta(hours=2)
+
+    await _persist(persistence, company, _result(), t4)
+    await _persist(persistence, company, _result(), t5)
+
+    observation = await _only_observation(vacancies, vacancy.id)
+    canonical = await vacancies.get(vacancy.id)
+    assert observation.status is VacancyStatus.CLOSED
+    assert observation.closed_at == t5
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+    assert canonical.closed_at == t5
 
 
 @pytest.mark.asyncio
@@ -696,6 +953,101 @@ async def test_failure_during_success_health_rolls_back_lifecycle_changes(
     assert stored_company.last_checked_at == T0
     assert stored_company.last_success_at == T0
     assert stored_company.last_complete_snapshot_at == T0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("apply_before_failure", [False, True])
+async def test_aggregation_failure_rolls_back_observation_canonical_and_health(
+    database,
+    monkeypatch,
+    apply_before_failure: bool,
+) -> None:
+    (
+        _,
+        companies,
+        vacancies,
+        persistence,
+        company,
+        vacancy,
+    ) = await _setup_active_observation(database)
+    await _persist(persistence, company, _result(), T1)
+    original = repositories._aggregate_canonical_lifecycle
+
+    async def fail_aggregation(*args, **kwargs) -> None:
+        if apply_before_failure:
+            await original(*args, **kwargs)
+        raise RuntimeError("injected aggregation failure")
+
+    monkeypatch.setattr(
+        repositories,
+        "_aggregate_canonical_lifecycle",
+        fail_aggregation,
+    )
+
+    with pytest.raises(RuntimeError, match="aggregation failure"):
+        await _persist(persistence, company, _result(), T2)
+
+    observation = await _only_observation(vacancies, vacancy.id)
+    canonical = await vacancies.get(vacancy.id)
+    stored_company = await companies.get(company.id)
+    assert observation.status is VacancyStatus.ACTIVE
+    assert observation.missing_complete_snapshots == 1
+    assert observation.closed_at is None
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert canonical.closed_at is None
+    assert stored_company is not None
+    assert stored_company.last_success_at == T1
+    assert stored_company.last_complete_snapshot_at == T1
+
+
+@pytest.mark.asyncio
+async def test_separate_persistence_instances_serialize_shared_canonical_updates(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence_a = SQLAlchemyCollectionPersistence(session_factory)
+    persistence_b = SQLAlchemyCollectionPersistence(session_factory)
+    company_a = make_company(name="A", ats_identifier="concurrent-a")
+    company_b = make_company(
+        name="B",
+        ats_type=ATSType.LEVER,
+        ats_identifier="concurrent-b",
+    )
+    shared_url = "https://example.com/jobs/concurrent-shared"
+    vacancy_a = make_vacancy(
+        company_a.id,
+        source_job_id="concurrent-a",
+        url=shared_url,
+    )
+    vacancy_b = make_vacancy(
+        company_b.id,
+        source=VacancySource.LEVER,
+        source_job_id="concurrent-b",
+        url=shared_url,
+    )
+    await companies.add(company_a)
+    await companies.add(company_b)
+    await _persist(persistence_a, company_a, _result((vacancy_a,)), T0)
+    await _persist(persistence_b, company_b, _result((vacancy_b,)), T0)
+    await _persist(persistence_a, company_a, _result(), T1)
+    await _persist(persistence_b, company_b, _result(), T1)
+
+    result_a, result_b = await asyncio.gather(
+        _persist(persistence_a, company_a, _result(), T2),
+        _persist(persistence_b, company_b, _result(), T2),
+    )
+
+    canonical = await vacancies.get(vacancy_a.id)
+    observations = await vacancies.list_observations(vacancy_a.id)
+    assert result_a.applied is True
+    assert result_b.applied is True
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+    assert canonical.closed_at == T2
+    assert {item.status for item in observations} == {VacancyStatus.CLOSED}
 
 
 @pytest.mark.asyncio

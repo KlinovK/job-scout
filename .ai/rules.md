@@ -33,7 +33,8 @@ These rules apply to all JobScout changes. `AGENTS.md` defines when to read the 
 - Reject stale completed runs before they mutate durable collection state.
 - Scope observation lifecycle changes to the exact source-company ownership boundary.
 - Preserve the active -> first miss -> second miss/closed lifecycle and authoritative reopen behavior.
-- Do not treat canonical vacancy status as a proven aggregate of all observations; that aggregation is not implemented.
+- Derive canonical vacancy lifecycle only from the complete linked observation
+  set inside accepted collection persistence; ambiguous evidence prevents closure.
 - Make schema changes through Alembic, with upgrade-path tests and isolated databases.
 
 ## Secrets and Runtime State

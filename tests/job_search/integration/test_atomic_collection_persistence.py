@@ -4,8 +4,9 @@ from datetime import datetime
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from job_search.application.models import (
     CollectionCoverage,
@@ -16,6 +17,9 @@ from job_search.application.services import CollectJobsService
 from job_search.domain.enums import ATSType, SourceHealthStatus, VacancyStatus
 from job_search.domain.models import Company, JobVacancy
 from job_search.infrastructure.persistence.sqlalchemy import repositories
+from job_search.infrastructure.persistence.sqlalchemy.database import (
+    create_database_engine,
+)
 from job_search.infrastructure.persistence.sqlalchemy.models import (
     JobVacancyRecord,
     VacancyObservationRecord,
@@ -198,7 +202,7 @@ async def test_failure_during_success_health_update_rolls_back_everything(
 
 
 @pytest.mark.asyncio
-async def test_incomplete_replay_is_idempotent_and_preserves_lifecycle_state(
+async def test_exact_replay_preserves_state_but_later_incomplete_positive_reopens(
     database,
 ) -> None:
     _, session_factory = database
@@ -231,6 +235,8 @@ async def test_incomplete_replay_is_idempotent_and_preserves_lifecycle_state(
         result,
         _health(NOW, 1),
     )
+    after_exact_replay = await vacancies.get(vacancy.id)
+    observations_after_exact_replay = await vacancies.list_observations(vacancy.id)
     later_replay = await persistence.persist_collection(
         company.id,
         result,
@@ -241,16 +247,22 @@ async def test_incomplete_replay_is_idempotent_and_preserves_lifecycle_state(
     observations = await vacancies.list_observations(vacancy.id)
     assert first.applied is True
     assert exact_replay.applied is False
+    assert after_exact_replay is not None
+    assert after_exact_replay.status is VacancyStatus.CLOSED
+    assert after_exact_replay.closed_at == LATER
+    assert observations_after_exact_replay[0].status is VacancyStatus.CLOSED
+    assert observations_after_exact_replay[0].closed_at == LATER
+    assert observations_after_exact_replay[0].missing_complete_snapshots == 2
     assert later_replay.applied is True
     assert later_replay.vacancy_upsert.updated == 1
     assert await _row_counts(session_factory) == (1, 1)
     assert stored is not None
     assert stored.id == vacancy.id
-    assert stored.status is VacancyStatus.CLOSED
-    assert stored.closed_at == LATER
-    assert observations[0].status is VacancyStatus.CLOSED
-    assert observations[0].closed_at == LATER
-    assert observations[0].missing_complete_snapshots == 2
+    assert stored.status is VacancyStatus.ACTIVE
+    assert stored.closed_at is None
+    assert observations[0].status is VacancyStatus.ACTIVE
+    assert observations[0].closed_at is None
+    assert observations[0].missing_complete_snapshots == 0
 
 
 @pytest.mark.asyncio
@@ -461,3 +473,50 @@ async def test_overlapping_runs_cannot_apply_an_older_result_after_a_newer_one(
     assert active[0].last_seen_at == LATER
     assert stored_company is not None
     assert stored_company.last_success_at == LATER
+
+
+@pytest.mark.asyncio
+async def test_sqlite_lock_contention_rolls_back_without_partial_lifecycle_state(
+    database,
+) -> None:
+    engine, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    company = make_company()
+    vacancy = make_vacancy(company.id)
+    await companies.add(company)
+    await SQLAlchemyCollectionPersistence(session_factory).persist_collection(
+        company.id,
+        _result((vacancy,)),
+        _health(NOW, 1),
+    )
+    contender_engine = create_database_engine(f"{engine.url}?timeout=0.01")
+    contender_factory = async_sessionmaker(
+        contender_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    locker = session_factory()
+    try:
+        await locker.execute(text("BEGIN IMMEDIATE"))
+        with pytest.raises(OperationalError):
+            await SQLAlchemyCollectionPersistence(contender_factory).persist_collection(
+                company.id,
+                _result(()),
+                _health(LATER, 0),
+            )
+    finally:
+        await locker.rollback()
+        await locker.close()
+        await contender_engine.dispose()
+
+    stored_company = await companies.get(company.id)
+    canonical = await vacancies.get(vacancy.id)
+    observations = await vacancies.list_observations(vacancy.id)
+    assert stored_company is not None
+    assert stored_company.last_success_at == NOW
+    assert stored_company.last_complete_snapshot_at == NOW
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert observations[0].status is VacancyStatus.ACTIVE
+    assert observations[0].missing_complete_snapshots == 0

@@ -51,20 +51,48 @@ Important identity boundaries:
 
 Completed collection persistence is atomic. The implementation checks durable ordering before mutation, so an older completed run cannot overwrite newer state. A transaction either records the coherent collection outcome or rolls it back.
 
-## Observation Lifecycle Through C.2C.2
+## Vacancy Lifecycle
 
 Eligible authoritative snapshots reconcile observations owned by that exact source company:
 
 1. Seen observations are active and their absence counter is cleared.
 2. An active observation missing from the first eligible snapshot records its first miss.
 3. A second consecutive eligible miss closes the observation.
-4. Seeing a closed observation again reopens it.
+4. A valid positive active row reopens its observation even when its collection
+   is incomplete or rolling-window, because presence is positive evidence.
+5. A provider's explicit closed row records trustworthy closure using its
+   timestamp or the accepted collection timestamp.
 
-Filtered subsets, rolling windows, incomplete pagination, malformed payloads, and failed runs cannot advance absence state. `last_complete_snapshot_at` is updated only by an eligible snapshot. Canonical vacancy lifecycle is not yet an aggregate of multiple observation states, and candidate filtering by observation lifecycle is not yet implemented. Consumers must not infer either capability.
+Filtered subsets, rolling windows, incomplete pagination, malformed payloads,
+and failed runs cannot advance absence state. `last_complete_snapshot_at` is
+updated only by an eligible snapshot.
+
+Canonical lifecycle is derived atomically from all linked observations affected
+by an accepted collection. Any active observation, NULL-owned legacy
+observation, observation without trustworthy closure time, or empty observation
+set keeps the canonical vacancy active. The canonical vacancy closes only when
+every linked observation is owned, closed, and timestamped. Reopening clears
+canonical `closed_at`; repeated closure preserves it; reclosure records a new
+accepted transition time without timestamp regression.
+
+The lifecycle data migration only reopens unsafe legacy closed canonical rows.
+It never closes an active row, invents ownership or timestamps, or modifies
+observation history.
 
 ## Classification and Queries
 
-The current classifier is deterministic and versioned as `ios-v1`. Classifications are persisted rather than recomputed implicitly. Application services expose collection, classification, candidates, company import/list/health, duplicate inspection, and vacancy-source inspection through `src/job_search/presentation/cli.py`.
+The current classifier is deterministic and versioned as `ios-v1`.
+Classifications are persisted rather than recomputed implicitly. Active
+candidate retrieval joins canonical vacancies and applies lifecycle filtering
+in SQL before ordering and limits. Historical classifications remain stored,
+and direct vacancy-source inspection exposes canonical and observation
+lifecycle fields. Application services expose these workflows through
+`src/job_search/presentation/cli.py`.
+
+SQLite is the only supported database. Its writer serialization combines with
+the per-company stale guard and atomic aggregation transaction. Lock contention
+fails the collection without a partial commit. PostgreSQL support would require
+additional canonical-row concurrency controls and is not currently implemented.
 
 There is no FastAPI service or LLM provider in the implemented Core. These are not assumed by the current architecture.
 
@@ -75,6 +103,9 @@ There is no FastAPI service or LLM provider in the implemented Core. These are n
 - Persistence of a completed collection is atomic.
 - Stale runs cannot mutate newer durable collection state.
 - Observation reconciliation never crosses source-company ownership.
+- Canonical lifecycle derives from the complete linked observation set.
+- Ambiguous or active evidence prevents canonical closure.
+- Candidate limits are applied only after active lifecycle filtering.
 - Network calls remain outside database transactions.
 - Source provenance remains queryable after canonicalization.
 - Legacy Telegram runtime state remains separate from Core persistence.

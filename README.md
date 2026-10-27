@@ -48,7 +48,12 @@ opaque score.
   back, while older or replayed results cannot overwrite newer persisted data.
 - **Safe observation reconciliation:** authoritative complete snapshots close
   an observation only after two consecutive misses and reopen it when it
-  reappears. Incomplete and rolling-window results never drive lifecycle state.
+  reappears. Incomplete and rolling-window absence never closes a vacancy,
+  while a valid positive row from either can reopen it.
+- **Canonical lifecycle aggregation:** canonical status is derived atomically
+  from every linked observation. Any active or ambiguous observation keeps the
+  vacancy active; closure requires attributable, timestamped evidence from all
+  observations.
 - **Explainable iOS classification:** a deterministic, versioned ruleset emits
   `MATCH`, `POSSIBLE_MATCH`, or `REJECT` with structured signals, warnings, and
   rejection reasons.
@@ -56,9 +61,12 @@ opaque score.
   `invalid_configuration` are distinct persisted outcomes. A non-empty payload
   whose records are all malformed fails the source rather than masquerading as
   a legitimate empty result; mixed payloads preserve valid records.
+- **Lifecycle-aware candidate review:** active candidates are filtered in SQL
+  before ordering and limits; classifications remain stored for historical
+  inspection.
 - **CLI workflows:** registry import and inspection, collection, external
   collection, classification, candidate review, source health, duplicate
-  diagnostics, and vacancy provenance inspection.
+  diagnostics, and lifecycle-aware vacancy provenance inspection.
 - **Legacy Telegram integration:** a separate Telethon collector scans
   configured channels, applies its own vacancy filters, and forwards matches to
   Saved Messages. It is intentionally not yet unified with the core pipeline.
@@ -147,21 +155,30 @@ Canonical vacancies, source observations, ownership, and successful source
 health commit together or roll back together. Persistence failures are reported
 separately from source API failures. Exact replays are no-ops, older results are
 rejected at the database write boundary, and existing lifecycle state is not
-reset by non-authoritative collection upserts.
+changed by non-authoritative absence.
 
-### Authoritative observation reconciliation
+### Observation and canonical lifecycle
 
 Only a reconciliation-eligible `FULL_BOARD` result can advance
 `last_complete_snapshot_at`. One missing complete snapshot increments an active
 observation's counter; the second closes it and records that snapshot's time.
-The counter then remains bounded at two. Reappearance in a later authoritative
-snapshot reactivates the observation and clears its counter and closure time.
-Incomplete, malformed, filtered, and rolling-window results—including hh.ru
-and AgileFluent searches—cannot increment, close, reopen, or advance complete
-snapshot metadata. Replays and stale snapshots are rejected before lifecycle
-updates. Canonical vacancy status is deliberately not derived from observation
-status yet, so one disappearing source cannot close a vacancy still supported
-by another source.
+The counter then remains bounded at two. Any valid positive active row in an
+accepted collection reactivates its observation and clears its counter and
+closure time, including rows from incomplete or rolling-window results.
+Incomplete, malformed, filtered, and rolling-window absence—including hh.ru
+and AgileFluent searches—cannot increment or close observations or advance
+complete snapshot metadata. An adapter's explicit closed row records closure
+at the accepted collection time when the provider supplies no timestamp.
+
+Canonical lifecycle is derived in the same transaction from all linked
+observations. Any active observation, unknown owner, missing closure timestamp,
+or empty observation set keeps the canonical vacancy active. It closes only
+when every observation has attributable, timestamped closure evidence; one
+source disappearing cannot close a vacancy supported elsewhere. Reopening
+clears canonical `closed_at`, repeated closure preserves it, and stale or exact
+replays are rejected before lifecycle mutation. The legacy repair migration
+reopens ambiguous closed canonical rows without modifying observation history
+or inventing timestamps.
 
 ### Explicit retry ownership
 
@@ -197,7 +214,7 @@ any database write.
 
 ## Quality
 
-The current repository contains **289 passing tests**, including unit,
+The current repository contains **302 passing tests**, including unit,
 integration, migration, adapter-contract, canonicalization, concurrency, and
 classification regression coverage.
 
@@ -222,6 +239,8 @@ There is no CI badge because CI has not been implemented yet.
 - source observations, conservative cross-source canonicalization, and
   duplicate diagnostics;
 - two-snapshot, authoritative observation reconciliation with safe reopening;
+- all-observation canonical lifecycle aggregation and active-only candidate
+  filtering;
 - persisted source-health and malformed-source semantics;
 - bounded retry/backoff for safe GET source operations;
 - deterministic `ios-v1` classification and candidate inspection;
@@ -230,8 +249,7 @@ There is no CI badge because CI has not been implemented yet.
 
 ### In Progress / Next
 
-- canonical vacancy lifecycle aggregation over source observations;
-- a query layer over normalized vacancies and classifications;
+- a broader query layer over normalized vacancies and classifications;
 - operational hardening of scheduled collection and local runtime security.
 
 ### Planned
@@ -403,9 +421,10 @@ main.py                       Separate legacy Telegram collector
 
 ## Current Limitations
 
-- Vacancy disappearance/closure is not reconciled across the general source
-  pipeline. hh.ru can map an explicitly archived detail response to `closed`,
-  but this is not a complete lifecycle system.
+- Canonical lifecycle concurrency guarantees currently target SQLite. A future
+  PostgreSQL backend would require canonical-row locking or equivalent controls.
+- Legacy observations whose source-company ownership cannot be reconstructed
+  keep their canonical vacancy active conservatively.
 - Greenhouse list responses do not provide a reliable publication timestamp,
   so those records may have `published_at = NULL`.
 - hh.ru requires OAuth; its adapter is disabled in the default registry.
@@ -425,10 +444,9 @@ main.py                       Separate legacy Telegram collector
 
 ## Roadmap
 
-1. Reconcile vacancy lifecycle and stale/closed records.
-2. Add a query layer for normalized vacancies and classifications.
-3. Harden the operational collection pipeline and observability.
-4. Expose reviewed query use cases through FastAPI.
-5. Define AI analysis contracts, fixtures, and an evaluation dataset.
-6. Add structured LLM analysis and ranking behind those evaluations.
-7. Unify delivery channels with the normalized pipeline.
+1. Add a broader query layer for normalized vacancies and classifications.
+2. Harden the operational collection pipeline and observability.
+3. Expose reviewed query use cases through FastAPI.
+4. Define AI analysis contracts, fixtures, and an evaluation dataset.
+5. Add structured LLM analysis and ranking behind those evaluations.
+6. Unify delivery channels with the normalized pipeline.

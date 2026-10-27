@@ -401,7 +401,7 @@ class ListCandidateVacanciesService:
         *,
         limit: int | None = None,
     ) -> tuple[CandidateVacancy, ...]:
-        classifications = await self._classifications.list_by_decisions(
+        classifications = await self._classifications.list_active_by_decisions(
             classifier_version,
             (
                 ClassificationDecision.MATCH,

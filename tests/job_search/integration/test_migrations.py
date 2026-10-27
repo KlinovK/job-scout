@@ -382,8 +382,8 @@ def test_lifecycle_migration_preserves_data_and_backfills_only_exact_ownership(
             ),
         ]
         assert vacancies == [
-            (vacancy_exact, "closed", None, first_seen, last_seen),
-            (vacancy_ambiguous, "closed", None, first_seen, last_seen),
+            (vacancy_exact, "active", None, first_seen, last_seen),
+            (vacancy_ambiguous, "active", None, first_seen, last_seen),
         ]
         assert classification == (vacancy_exact, "ios-v1", "match")
         assert company_watermarks == [(None,), (None,)]
@@ -472,3 +472,128 @@ def test_lifecycle_migration_preserves_data_and_backfills_only_exact_ownership(
         connection.rollback()
     finally:
         connection.close()
+
+
+def test_canonical_lifecycle_migration_repairs_only_unsafe_closed_rows(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "canonical-lifecycle.db"
+    monkeypatch.setenv(
+        "JOB_SEARCH_DATABASE_URL",
+        f"sqlite+aiosqlite:///{database_path}",
+    )
+    config = Config("alembic.ini")
+    command.upgrade(config, "20261009_0006")
+
+    company_id = "00000000-0000-0000-0000-000000000001"
+    first_seen = "2026-09-17T08:00:00+00:00"
+    closed_at = "2026-09-18T08:00:00+00:00"
+    cases = {
+        "active-observation": "00000000-0000-0000-0000-000000000011",
+        "null-owner": "00000000-0000-0000-0000-000000000012",
+        "zero-observations": "00000000-0000-0000-0000-000000000013",
+        "missing-canonical-time": "00000000-0000-0000-0000-000000000014",
+        "reliable-closed": "00000000-0000-0000-0000-000000000015",
+        "existing-active": "00000000-0000-0000-0000-000000000016",
+    }
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO companies "
+            "(id, name, careers_url, ats_type, ats_identifier, priority, enabled, "
+            "created_at, updated_at, provenance) "
+            "VALUES (?, 'Migration', 'https://example.com/careers', 'greenhouse', "
+            "'migration', 10, 1, ?, ?, 'manual')",
+            (company_id, first_seen, first_seen),
+        )
+        for name, vacancy_id in cases.items():
+            status = "active" if name == "existing-active" else "closed"
+            canonical_closed_at = (
+                None if name == "missing-canonical-time" else closed_at
+            )
+            if status == "active":
+                canonical_closed_at = None
+            connection.execute(
+                "INSERT INTO job_vacancies "
+                "(id, company_id, title, description, remote_policy, url, source, "
+                "source_job_id, first_seen_at, last_seen_at, status, closed_at) "
+                "VALUES (?, ?, ?, 'Swift', 'remote', ?, 'greenhouse', ?, ?, ?, ?, ?)",
+                (
+                    vacancy_id,
+                    company_id,
+                    name,
+                    f"https://example.com/jobs/{name}",
+                    name,
+                    first_seen,
+                    first_seen,
+                    status,
+                    canonical_closed_at,
+                ),
+            )
+
+        observation_cases = (
+            ("active-observation", company_id, "active", None),
+            ("null-owner", None, "closed", closed_at),
+            ("missing-canonical-time", company_id, "closed", closed_at),
+            ("reliable-closed", company_id, "closed", closed_at),
+            ("existing-active", company_id, "closed", closed_at),
+        )
+        for index, (name, owner, status, observation_closed_at) in enumerate(
+            observation_cases,
+            start=1,
+        ):
+            connection.execute(
+                "INSERT INTO vacancy_observations "
+                "(id, vacancy_id, source_company_id, discovered_via, source_job_id, "
+                "observation_url, title, first_seen_at, last_seen_at, status, "
+                "closed_at, missing_complete_snapshots) "
+                "VALUES (?, ?, ?, 'greenhouse', ?, ?, ?, ?, ?, ?, ?, 0)",
+                (
+                    f"00000000-0000-0000-0000-{index:012d}",
+                    cases[name],
+                    owner,
+                    name,
+                    f"https://example.com/jobs/{name}",
+                    name,
+                    first_seen,
+                    first_seen,
+                    status,
+                    observation_closed_at,
+                ),
+            )
+        observations_before = connection.execute(
+            "SELECT id, vacancy_id, source_company_id, status, closed_at, "
+            "missing_complete_snapshots FROM vacancy_observations ORDER BY id"
+        ).fetchall()
+        connection.commit()
+    finally:
+        connection.close()
+
+    command.upgrade(config, "head")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        lifecycle = dict(
+            connection.execute(
+                "SELECT title, status || ':' || COALESCE(closed_at, '-') "
+                "FROM job_vacancies"
+            ).fetchall()
+        )
+        observations_after = connection.execute(
+            "SELECT id, vacancy_id, source_company_id, status, closed_at, "
+            "missing_complete_snapshots FROM vacancy_observations ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert lifecycle == {
+        "active-observation": "active:-",
+        "null-owner": "active:-",
+        "zero-observations": "active:-",
+        "missing-canonical-time": "active:-",
+        "reliable-closed": f"closed:{closed_at}",
+        "existing-active": "active:-",
+    }
+    assert observations_after == observations_before

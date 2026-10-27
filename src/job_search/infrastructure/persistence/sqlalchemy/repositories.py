@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -51,6 +52,12 @@ from job_search.infrastructure.persistence.sqlalchemy.models import (
 )
 
 _MISSING_SNAPSHOTS_TO_CLOSE = 2
+
+
+@dataclass(frozen=True, slots=True)
+class _VacancyUpsertOutcome:
+    result: VacancyUpsertResult
+    affected_vacancy_ids: frozenset[str]
 
 
 def _encode_enum_values(values: Sequence[StrEnum]) -> str:
@@ -131,8 +138,8 @@ def _vacancy_to_record(vacancy: JobVacancy) -> JobVacancyRecord:
         published_at=vacancy.published_at,
         first_seen_at=vacancy.first_seen_at,
         last_seen_at=vacancy.last_seen_at,
-        status=vacancy.status.value,
-        closed_at=vacancy.closed_at,
+        status=VacancyStatus.ACTIVE.value,
+        closed_at=None,
     )
 
 
@@ -194,8 +201,14 @@ def _new_observation(
     vacancy: JobVacancy,
     canonical_vacancy_id: str,
     canonical_url: str,
+    observed_at: datetime | None = None,
 ) -> VacancyObservationRecord:
     identity = f"{vacancy.company_id}:{vacancy.source.value}:{vacancy.source_job_id}"
+    closed_at = (
+        vacancy.closed_at or observed_at
+        if vacancy.status is VacancyStatus.CLOSED
+        else None
+    )
     return VacancyObservationRecord(
         id=str(uuid5(NAMESPACE_URL, f"vacancy-observation:{identity}")),
         vacancy_id=canonical_vacancy_id,
@@ -211,10 +224,35 @@ def _new_observation(
         work_location=vacancy.work_location,
         first_seen_at=vacancy.first_seen_at,
         last_seen_at=vacancy.last_seen_at,
-        status=vacancy.status.value,
-        closed_at=vacancy.closed_at,
+        status=(
+            VacancyStatus.CLOSED.value
+            if closed_at is not None
+            else VacancyStatus.ACTIVE.value
+        ),
+        closed_at=closed_at,
         missing_complete_snapshots=0,
     )
+
+
+def _refresh_observation_from_positive_row(
+    observation: VacancyObservationRecord,
+    vacancy: JobVacancy,
+    observed_at: datetime | None,
+) -> None:
+    if vacancy.status is VacancyStatus.ACTIVE:
+        _mark_observation_present(observation)
+        return
+
+    closed_at = vacancy.closed_at or observed_at
+    if closed_at is None:
+        return
+    if (
+        observation.status != VacancyStatus.CLOSED.value
+        or observation.closed_at is None
+    ):
+        observation.status = VacancyStatus.CLOSED.value
+        observation.closed_at = closed_at
+    observation.missing_complete_snapshots = 0
 
 
 def _update_canonical_record(
@@ -287,11 +325,14 @@ def _classification_to_domain(
 async def _upsert_vacancies(
     session: AsyncSession,
     vacancies: Sequence[JobVacancy],
-) -> VacancyUpsertResult:
+    *,
+    observed_at: datetime | None,
+) -> _VacancyUpsertOutcome:
     created = 0
     updated = 0
     observations_created = 0
     cross_source_duplicates_collapsed = 0
+    affected_vacancy_ids: set[str] = set()
     for vacancy in vacancies:
         canonical_url = vacancy.canonical_url or normalize_canonical_url(vacancy.url)
         source_statement = select(VacancyObservationRecord).where(
@@ -319,6 +360,12 @@ async def _upsert_vacancies(
             observation.title = vacancy.title
             observation.work_location = vacancy.work_location
             observation.last_seen_at = vacancy.last_seen_at
+            _refresh_observation_from_positive_row(
+                observation,
+                vacancy,
+                observed_at,
+            )
+            affected_vacancy_ids.add(record.id)
             if (
                 record.source == vacancy.source.value
                 and record.source_job_id == vacancy.source_job_id
@@ -342,7 +389,10 @@ async def _upsert_vacancies(
             record = _vacancy_to_record(vacancy)
             session.add(record)
             await session.flush()
-            session.add(_new_observation(vacancy, record.id, canonical_url))
+            session.add(
+                _new_observation(vacancy, record.id, canonical_url, observed_at)
+            )
+            affected_vacancy_ids.add(record.id)
             created += 1
             observations_created += 1
             continue
@@ -353,7 +403,8 @@ async def _upsert_vacancies(
         )
         if record is None:
             raise LookupError("Canonical observation points to a missing vacancy")
-        session.add(_new_observation(vacancy, record.id, canonical_url))
+        session.add(_new_observation(vacancy, record.id, canonical_url, observed_at))
+        affected_vacancy_ids.add(record.id)
         observations_created += 1
         cross_source_duplicates_collapsed += int(
             matching_observation.discovered_via != vacancy.source.value
@@ -364,11 +415,14 @@ async def _upsert_vacancies(
             _update_canonical_record(record, vacancy, canonical_url)
         updated += 1
 
-    return VacancyUpsertResult(
-        created=created,
-        updated=updated,
-        observations_created=observations_created,
-        cross_source_duplicates_collapsed=cross_source_duplicates_collapsed,
+    return _VacancyUpsertOutcome(
+        result=VacancyUpsertResult(
+            created=created,
+            updated=updated,
+            observations_created=observations_created,
+            cross_source_duplicates_collapsed=cross_source_duplicates_collapsed,
+        ),
+        affected_vacancy_ids=frozenset(affected_vacancy_ids),
     )
 
 
@@ -414,9 +468,15 @@ def _mark_observation_missing(
     observation: VacancyObservationRecord,
     snapshot_at: datetime,
 ) -> None:
-    if observation.status == VacancyStatus.CLOSED.value:
+    if (
+        observation.status == VacancyStatus.CLOSED.value
+        and observation.closed_at is not None
+    ):
         observation.missing_complete_snapshots = _MISSING_SNAPSHOTS_TO_CLOSE
         return
+    if observation.status == VacancyStatus.CLOSED.value:
+        observation.status = VacancyStatus.ACTIVE.value
+        observation.missing_complete_snapshots = 0
     observation.missing_complete_snapshots = min(
         observation.missing_complete_snapshots + 1,
         _MISSING_SNAPSHOTS_TO_CLOSE,
@@ -438,17 +498,75 @@ async def _reconcile_observations(
     source: str,
     present_source_job_ids: set[str],
     snapshot_at: datetime,
-) -> None:
+) -> set[str]:
     statement = select(VacancyObservationRecord).where(
         VacancyObservationRecord.source_company_id == str(company_id),
         VacancyObservationRecord.discovered_via == source,
     )
     observations = (await session.scalars(statement)).all()
+    affected_vacancy_ids: set[str] = set()
     for observation in observations:
+        affected_vacancy_ids.add(observation.vacancy_id)
         if observation.source_job_id in present_source_job_ids:
-            _mark_observation_present(observation)
             continue
         _mark_observation_missing(observation, snapshot_at)
+    return affected_vacancy_ids
+
+
+async def _aggregate_canonical_lifecycle(
+    session: AsyncSession,
+    vacancy_ids: set[str],
+    transition_at: datetime | None,
+) -> None:
+    if not vacancy_ids:
+        return
+
+    await session.flush()
+    canonical_records = (
+        await session.scalars(
+            select(JobVacancyRecord).where(JobVacancyRecord.id.in_(vacancy_ids))
+        )
+    ).all()
+    observations = (
+        await session.scalars(
+            select(VacancyObservationRecord).where(
+                VacancyObservationRecord.vacancy_id.in_(vacancy_ids)
+            )
+        )
+    ).all()
+    observations_by_vacancy: dict[str, list[VacancyObservationRecord]] = {}
+    for observation in observations:
+        observations_by_vacancy.setdefault(observation.vacancy_id, []).append(
+            observation
+        )
+
+    for canonical in canonical_records:
+        linked = observations_by_vacancy.get(canonical.id, [])
+        trustworthy_closure = bool(linked) and all(
+            observation.source_company_id is not None
+            and observation.status == VacancyStatus.CLOSED.value
+            and observation.closed_at is not None
+            for observation in linked
+        )
+        if not trustworthy_closure:
+            canonical.status = VacancyStatus.ACTIVE.value
+            canonical.closed_at = None
+            continue
+
+        if (
+            canonical.status == VacancyStatus.CLOSED.value
+            and canonical.closed_at is not None
+        ):
+            continue
+        closure_times = [
+            observation.closed_at
+            for observation in linked
+            if observation.closed_at is not None
+        ]
+        if transition_at is not None:
+            closure_times.append(transition_at)
+        canonical.status = VacancyStatus.CLOSED.value
+        canonical.closed_at = max(closure_times)
 
 
 def _advance_complete_snapshot(
@@ -646,20 +764,33 @@ class SQLAlchemyCollectionPersistence:
                 raise ValueError(
                     "all vacancies must match the collected company source"
                 )
-            upserted = await _upsert_vacancies(session, result.vacancies)
+            upserted = await _upsert_vacancies(
+                session,
+                result.vacancies,
+                observed_at=health.checked_at,
+            )
+            affected_vacancy_ids = set(upserted.affected_vacancy_ids)
             if result.reconciliation_eligible:
-                await _reconcile_observations(
-                    session,
-                    company_id,
-                    source,
-                    {vacancy.source_job_id for vacancy in result.vacancies},
-                    health.checked_at,
+                affected_vacancy_ids.update(
+                    await _reconcile_observations(
+                        session,
+                        company_id,
+                        source,
+                        {vacancy.source_job_id for vacancy in result.vacancies},
+                        health.checked_at,
+                    )
                 )
+            await _aggregate_canonical_lifecycle(
+                session,
+                affected_vacancy_ids,
+                health.checked_at,
+            )
+            if result.reconciliation_eligible:
                 _advance_complete_snapshot(company, health.checked_at)
             await _apply_success_health(session, company_id, health)
             return CollectionPersistenceResult(
                 applied=True,
-                vacancy_upsert=upserted,
+                vacancy_upsert=upserted.result,
             )
 
 
@@ -703,7 +834,17 @@ class SQLAlchemyVacancyRepository:
         vacancies: Sequence[JobVacancy],
     ) -> VacancyUpsertResult:
         async with self._session_factory() as session, session.begin():
-            return await _upsert_vacancies(session, vacancies)
+            upserted = await _upsert_vacancies(
+                session,
+                vacancies,
+                observed_at=None,
+            )
+            await _aggregate_canonical_lifecycle(
+                session,
+                set(upserted.affected_vacancy_ids),
+                None,
+            )
+            return upserted.result
 
     async def list_active(self) -> Sequence[JobVacancy]:
         async with self._session_factory() as session:
@@ -868,6 +1009,40 @@ class SQLAlchemyClassificationRepository:
                 .order_by(
                     VacancyClassificationRecord.decision,
                     VacancyClassificationRecord.classified_at.desc(),
+                    VacancyClassificationRecord.vacancy_id,
+                )
+            )
+            if limit is not None:
+                statement = statement.limit(limit)
+            records = (await session.scalars(statement)).all()
+            return tuple(_classification_to_domain(record) for record in records)
+
+    async def list_active_by_decisions(
+        self,
+        classifier_version: str,
+        decisions: Sequence[ClassificationDecision],
+        *,
+        limit: int | None = None,
+    ) -> Sequence[VacancyClassification]:
+        async with self._session_factory() as session:
+            statement = (
+                select(VacancyClassificationRecord)
+                .join(
+                    JobVacancyRecord,
+                    JobVacancyRecord.id == VacancyClassificationRecord.vacancy_id,
+                )
+                .where(
+                    VacancyClassificationRecord.classifier_version
+                    == classifier_version,
+                    VacancyClassificationRecord.decision.in_(
+                        decision.value for decision in decisions
+                    ),
+                    JobVacancyRecord.status == VacancyStatus.ACTIVE.value,
+                )
+                .order_by(
+                    VacancyClassificationRecord.decision,
+                    VacancyClassificationRecord.classified_at.desc(),
+                    VacancyClassificationRecord.vacancy_id,
                 )
             )
             if limit is not None:

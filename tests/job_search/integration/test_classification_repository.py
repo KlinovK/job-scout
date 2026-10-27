@@ -1,4 +1,5 @@
 from dataclasses import replace
+from uuid import UUID
 
 import pytest
 from sqlalchemy import func, select
@@ -7,7 +8,9 @@ from sqlalchemy.exc import IntegrityError
 from job_search.application.services import ListCandidateVacanciesService
 from job_search.domain.classification import ClassificationDecision
 from job_search.domain.classifier import IOSVacancyClassifier
+from job_search.domain.enums import VacancyStatus
 from job_search.infrastructure.persistence.sqlalchemy.models import (
+    JobVacancyRecord,
     VacancyClassificationRecord,
 )
 from job_search.infrastructure.persistence.sqlalchemy.repositories import (
@@ -111,6 +114,100 @@ async def test_candidate_decision_query_and_limit(database) -> None:
         ClassificationDecision.POSSIBLE_MATCH,
     ]
     assert all(item.company.id == company.id for item in candidates)
+
+
+@pytest.mark.asyncio
+async def test_active_candidate_filter_runs_before_limit_and_keeps_history(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    classifications = SQLAlchemyClassificationRepository(session_factory)
+    company = make_company()
+    await companies.add(company)
+    closed = make_vacancy(
+        company.id,
+        source_job_id="closed-match",
+        title="Senior iOS Engineer",
+        description="Swift. Remote worldwide.",
+        status=VacancyStatus.CLOSED,
+        closed_at=LATER,
+    )
+    active = make_vacancy(
+        company.id,
+        source_job_id="active-match",
+        title="Senior iOS Engineer",
+        description="Swift. Remote worldwide.",
+    )
+    await vacancies.upsert_many([closed, active])
+    classifier = IOSVacancyClassifier()
+    closed_classification = classifier.classify(closed, LATER)
+    active_classification = classifier.classify(active, NOW)
+    await classifications.upsert_many([closed_classification, active_classification])
+
+    historical = await classifications.list_by_decisions(
+        classifier.version,
+        (ClassificationDecision.MATCH,),
+        limit=1,
+    )
+    current = await classifications.list_active_by_decisions(
+        classifier.version,
+        (ClassificationDecision.MATCH,),
+        limit=1,
+    )
+    candidates = await ListCandidateVacanciesService(
+        companies,
+        vacancies,
+        classifications,
+    ).list_candidates(classifier.version, limit=1)
+
+    assert historical == (closed_classification,)
+    assert current == (active_classification,)
+    assert [candidate.vacancy.id for candidate in candidates] == [active.id]
+    assert len(await classifications.list_for_version(classifier.version)) == 2
+    async with session_factory() as session:
+        stored_closed = await session.get(JobVacancyRecord, str(closed.id))
+    assert stored_closed is not None
+    assert stored_closed.status == VacancyStatus.CLOSED.value
+
+
+@pytest.mark.asyncio
+async def test_active_candidate_order_uses_vacancy_id_as_stable_tie_breaker(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    classifications = SQLAlchemyClassificationRepository(session_factory)
+    company = make_company()
+    await companies.add(company)
+    later_id = make_vacancy(
+        company.id,
+        vacancy_id=UUID("00000000-0000-0000-0000-000000000002"),
+        source_job_id="later-id",
+        title="Senior iOS Engineer",
+        description="Swift. Remote worldwide.",
+    )
+    earlier_id = make_vacancy(
+        company.id,
+        vacancy_id=UUID("00000000-0000-0000-0000-000000000001"),
+        source_job_id="earlier-id",
+        title="Senior iOS Engineer",
+        description="Swift. Remote worldwide.",
+    )
+    await vacancies.upsert_many([later_id, earlier_id])
+    classifier = IOSVacancyClassifier()
+    await classifications.upsert_many(
+        [classifier.classify(item, NOW) for item in (later_id, earlier_id)]
+    )
+
+    results = await classifications.list_active_by_decisions(
+        classifier.version,
+        (ClassificationDecision.MATCH,),
+    )
+
+    assert [item.vacancy_id for item in results] == [earlier_id.id, later_id.id]
 
 
 @pytest.mark.asyncio
