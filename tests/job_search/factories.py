@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 from job_search.domain.enums import (
     ATSType,
     RemotePolicy,
+    VacancyClosureEvidence,
     VacancySource,
     VacancyStatus,
 )
@@ -54,6 +55,7 @@ def make_vacancy(
     original_source: VacancySource | None = None,
     status: VacancyStatus = VacancyStatus.ACTIVE,
     closed_at: datetime | None = None,
+    closure_evidence: VacancyClosureEvidence = VacancyClosureEvidence.UNKNOWN,
 ) -> JobVacancy:
     return JobVacancy(
         id=vacancy_id or uuid4(),
@@ -73,4 +75,5 @@ def make_vacancy(
         employer_name=employer_name,
         original_source=original_source,
         closed_at=closed_at,
+        closure_evidence=closure_evidence,
     )

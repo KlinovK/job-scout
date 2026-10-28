@@ -238,6 +238,7 @@ async def _run(
                     f"Source company ID: {observation.source_company_id or 'unknown'}"
                 )
                 print(f"Observation status: {observation.status.value}")
+                print(f"Closure evidence: {observation.closure_evidence.value}")
                 observation_closed_at = (
                     observation.closed_at.isoformat() if observation.closed_at else "-"
                 )

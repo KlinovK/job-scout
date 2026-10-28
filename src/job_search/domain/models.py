@@ -7,6 +7,7 @@ from job_search.domain.enums import (
     RegistryProvenance,
     RemotePolicy,
     SourceHealthStatus,
+    VacancyClosureEvidence,
     VacancySource,
     VacancyStatus,
 )
@@ -86,6 +87,7 @@ class JobVacancy:
     employment: str | None = None
     experience: str | None = None
     closed_at: datetime | None = None
+    closure_evidence: VacancyClosureEvidence = VacancyClosureEvidence.UNKNOWN
 
     def __post_init__(self) -> None:
         if not self.title.strip():
@@ -108,6 +110,11 @@ class JobVacancy:
         _require_utc(self.first_seen_at, "first_seen_at")
         _require_utc(self.last_seen_at, "last_seen_at")
         _require_utc(self.closed_at, "closed_at")
+        if (
+            self.status is VacancyStatus.ACTIVE
+            and self.closure_evidence is not VacancyClosureEvidence.UNKNOWN
+        ):
+            raise ValueError("active vacancy cannot carry closure evidence")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +136,7 @@ class VacancyObservation:
     status: VacancyStatus = VacancyStatus.ACTIVE
     closed_at: datetime | None = None
     missing_complete_snapshots: int = 0
+    closure_evidence: VacancyClosureEvidence = VacancyClosureEvidence.UNKNOWN
 
     def __post_init__(self) -> None:
         if not self.source_job_id.strip():
@@ -142,3 +150,9 @@ class VacancyObservation:
         _require_utc(self.closed_at, "closed_at")
         if self.missing_complete_snapshots < 0:
             raise ValueError("missing_complete_snapshots must not be negative")
+        if self.closure_evidence is not VacancyClosureEvidence.UNKNOWN and (
+            self.status is not VacancyStatus.CLOSED or self.closed_at is None
+        ):
+            raise ValueError(
+                "authoritative closure evidence requires closed status and closed_at"
+            )

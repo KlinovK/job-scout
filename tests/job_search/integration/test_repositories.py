@@ -11,6 +11,7 @@ from job_search.application.services import SeedCompaniesService
 from job_search.domain.enums import (
     ATSType,
     SourceHealthStatus,
+    VacancyClosureEvidence,
     VacancySource,
     VacancyStatus,
 )
@@ -134,6 +135,40 @@ async def test_vacancy_create_retrieve_and_update_preserves_identity(database) -
     assert stored.title == "Senior iOS Engineer"
     assert stored.employer_name == "External Employer"
     assert await vacancies.get(original.id) == stored
+
+
+@pytest.mark.asyncio
+async def test_generic_closed_upsert_preserves_metadata_without_authority(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    company = make_company()
+    original = make_vacancy(company.id)
+    await companies.add(company)
+    await vacancies.upsert_many((original,))
+    direct_closed = replace(
+        original,
+        title="Updated closed metadata",
+        last_seen_at=LATER,
+        status=VacancyStatus.CLOSED,
+        closed_at=LATER,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
+    )
+
+    result = await vacancies.upsert_many((direct_closed,))
+
+    canonical = await vacancies.get(original.id)
+    observations = await vacancies.list_observations(original.id)
+    assert result.updated == 1
+    assert canonical is not None
+    assert canonical.title == "Updated closed metadata"
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert canonical.closed_at is None
+    assert observations[0].status is VacancyStatus.ACTIVE
+    assert observations[0].closed_at is None
+    assert observations[0].closure_evidence is VacancyClosureEvidence.UNKNOWN
 
 
 @pytest.mark.asyncio

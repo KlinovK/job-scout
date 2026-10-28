@@ -164,21 +164,28 @@ Only a reconciliation-eligible `FULL_BOARD` result can advance
 observation's counter; the second closes it and records that snapshot's time.
 The counter then remains bounded at two. Any valid positive active row in an
 accepted collection reactivates its observation and clears its counter and
-closure time, including rows from incomplete or rolling-window results.
+closure time and evidence, including rows from incomplete or rolling-window
+results.
 Incomplete, malformed, filtered, and rolling-window absence—including hh.ru
 and AgileFluent searches—cannot increment or close observations or advance
-complete snapshot metadata. An adapter's explicit closed row records closure
-at the accepted collection time when the provider supplies no timestamp.
+complete snapshot metadata. A verified adapter's explicit closed row records
+`provider_explicit` evidence at the accepted collection time when the provider
+supplies no timestamp. The second eligible absence records
+`authoritative_absence`; historical or direct-import closure remains `unknown`.
 
 Canonical lifecycle is derived in the same transaction from all linked
 observations. Any active observation, unknown owner, missing closure timestamp,
 or empty observation set keeps the canonical vacancy active. It closes only
-when every observation has attributable, timestamped closure evidence; one
-source disappearing cannot close a vacancy supported elsewhere. Reopening
+when every observation has attributable, timestamped `provider_explicit` or
+`authoritative_absence` evidence; one source disappearing cannot close a vacancy
+supported elsewhere. Generic vacancy upserts cannot manufacture authoritative
+evidence. Reopening
 clears canonical `closed_at`, repeated closure preserves it, and stale or exact
 replays are rejected before lifecycle mutation. The legacy repair migration
-reopens ambiguous closed canonical rows without modifying observation history
-or inventing timestamps.
+marks historical evidence `unknown` and reopens ambiguous closed canonical rows
+without modifying observation status, timestamps, ownership, or classifications.
+Lifecycle aggregation uses fixed-size batches below legacy SQLite parameter
+limits while retaining the complete linked observation set for each canonical.
 
 ### Explicit retry ownership
 

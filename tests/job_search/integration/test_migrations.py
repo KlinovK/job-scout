@@ -96,6 +96,7 @@ def test_initial_migration_creates_constraints_and_indexes(
         "status",
         "closed_at",
         "missing_complete_snapshots",
+        "closure_evidence",
     } <= observation_columns
     assert {
         "uq_vacancy_observations_owned_source_identity",
@@ -346,7 +347,7 @@ def test_lifecycle_migration_preserves_data_and_backfills_only_exact_ownership(
     try:
         observations = connection.execute(
             "SELECT id, source_company_id, status, closed_at, "
-            "missing_complete_snapshots, first_seen_at, last_seen_at "
+            "missing_complete_snapshots, closure_evidence, first_seen_at, last_seen_at "
             "FROM vacancy_observations ORDER BY id"
         ).fetchall()
         vacancies = connection.execute(
@@ -368,6 +369,7 @@ def test_lifecycle_migration_preserves_data_and_backfills_only_exact_ownership(
                 "closed",
                 None,
                 0,
+                "unknown",
                 first_seen,
                 last_seen,
             ),
@@ -377,6 +379,7 @@ def test_lifecycle_migration_preserves_data_and_backfills_only_exact_ownership(
                 "active",
                 None,
                 0,
+                "unknown",
                 first_seen,
                 last_seen,
             ),
@@ -399,6 +402,14 @@ def test_lifecycle_migration_preserves_data_and_backfills_only_exact_ownership(
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "UPDATE vacancy_observations SET status = 'unknown' WHERE id = ?",
+                (observation_exact,),
+            )
+        connection.rollback()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE vacancy_observations "
+                "SET closure_evidence = 'provider_explicit' WHERE id = ?",
                 (observation_exact,),
             )
         connection.rollback()
@@ -474,7 +485,7 @@ def test_lifecycle_migration_preserves_data_and_backfills_only_exact_ownership(
         connection.close()
 
 
-def test_canonical_lifecycle_migration_repairs_only_unsafe_closed_rows(
+def test_closure_evidence_migration_reopens_ambiguous_legacy_closure(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -484,7 +495,7 @@ def test_canonical_lifecycle_migration_repairs_only_unsafe_closed_rows(
         f"sqlite+aiosqlite:///{database_path}",
     )
     config = Config("alembic.ini")
-    command.upgrade(config, "20261009_0006")
+    command.upgrade(config, "20261027_0007")
 
     company_id = "00000000-0000-0000-0000-000000000001"
     first_seen = "2026-09-17T08:00:00+00:00"
@@ -494,7 +505,7 @@ def test_canonical_lifecycle_migration_repairs_only_unsafe_closed_rows(
         "null-owner": "00000000-0000-0000-0000-000000000012",
         "zero-observations": "00000000-0000-0000-0000-000000000013",
         "missing-canonical-time": "00000000-0000-0000-0000-000000000014",
-        "reliable-closed": "00000000-0000-0000-0000-000000000015",
+        "ambiguous-timestamped": "00000000-0000-0000-0000-000000000015",
         "existing-active": "00000000-0000-0000-0000-000000000016",
     }
     connection = sqlite3.connect(database_path)
@@ -513,8 +524,6 @@ def test_canonical_lifecycle_migration_repairs_only_unsafe_closed_rows(
             canonical_closed_at = (
                 None if name == "missing-canonical-time" else closed_at
             )
-            if status == "active":
-                canonical_closed_at = None
             connection.execute(
                 "INSERT INTO job_vacancies "
                 "(id, company_id, title, description, remote_policy, url, source, "
@@ -537,7 +546,7 @@ def test_canonical_lifecycle_migration_repairs_only_unsafe_closed_rows(
             ("active-observation", company_id, "active", None),
             ("null-owner", None, "closed", closed_at),
             ("missing-canonical-time", company_id, "closed", closed_at),
-            ("reliable-closed", company_id, "closed", closed_at),
+            ("ambiguous-timestamped", company_id, "closed", closed_at),
             ("existing-active", company_id, "closed", closed_at),
         )
         for index, (name, owner, status, observation_closed_at) in enumerate(
@@ -567,6 +576,15 @@ def test_canonical_lifecycle_migration_repairs_only_unsafe_closed_rows(
             "SELECT id, vacancy_id, source_company_id, status, closed_at, "
             "missing_complete_snapshots FROM vacancy_observations ORDER BY id"
         ).fetchall()
+        connection.execute(
+            "INSERT INTO vacancy_classifications "
+            "(vacancy_id, classifier_version, decision, role_category, seniority, "
+            "ios_relevance, work_mode, relocation, geography, positive_signals, "
+            "warnings, rejection_reasons, classified_at) "
+            "VALUES (?, 'ios-v1', 'match', 'ios', 'senior', 'strong', 'remote', "
+            "'unknown', 'worldwide', '', '', '', ?)",
+            (cases["ambiguous-timestamped"], first_seen),
+        )
         connection.commit()
     finally:
         connection.close()
@@ -585,6 +603,12 @@ def test_canonical_lifecycle_migration_repairs_only_unsafe_closed_rows(
             "SELECT id, vacancy_id, source_company_id, status, closed_at, "
             "missing_complete_snapshots FROM vacancy_observations ORDER BY id"
         ).fetchall()
+        evidence = connection.execute(
+            "SELECT closure_evidence FROM vacancy_observations ORDER BY id"
+        ).fetchall()
+        classifications = connection.execute(
+            "SELECT vacancy_id, classifier_version FROM vacancy_classifications"
+        ).fetchall()
     finally:
         connection.close()
 
@@ -593,7 +617,9 @@ def test_canonical_lifecycle_migration_repairs_only_unsafe_closed_rows(
         "null-owner": "active:-",
         "zero-observations": "active:-",
         "missing-canonical-time": "active:-",
-        "reliable-closed": f"closed:{closed_at}",
+        "ambiguous-timestamped": "active:-",
         "existing-active": "active:-",
     }
     assert observations_after == observations_before
+    assert evidence == [("unknown",)] * len(observations_before)
+    assert classifications == [(cases["ambiguous-timestamped"], "ios-v1")]

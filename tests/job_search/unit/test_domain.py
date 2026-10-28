@@ -5,6 +5,7 @@ import pytest
 
 from job_search.domain.classification import ClassificationDecision, RejectionReason
 from job_search.domain.classifier import IOSVacancyClassifier
+from job_search.domain.enums import VacancyClosureEvidence
 from tests.job_search.factories import NOW, make_company, make_vacancy
 
 
@@ -45,6 +46,17 @@ def test_vacancy_requires_external_identity() -> None:
             first_seen_at=vacancy.first_seen_at,
             last_seen_at=vacancy.last_seen_at,
             status=vacancy.status,
+        )
+
+
+def test_active_vacancy_rejects_authoritative_closure_evidence() -> None:
+    company = make_company()
+    vacancy = make_vacancy(company.id)
+
+    with pytest.raises(ValueError, match="active vacancy"):
+        replace(
+            vacancy,
+            closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
         )
 
 

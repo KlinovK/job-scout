@@ -14,6 +14,7 @@ from job_search.application.services import CollectJobsService
 from job_search.domain.enums import (
     ATSType,
     SourceHealthStatus,
+    VacancyClosureEvidence,
     VacancySource,
     VacancyStatus,
 )
@@ -145,6 +146,7 @@ async def test_second_missing_authoritative_snapshot_closes_observation(
     canonical = await vacancies.get(vacancy.id)
     stored_company = await companies.get(company.id)
     assert observation.status is VacancyStatus.CLOSED
+    assert observation.closure_evidence is VacancyClosureEvidence.AUTHORITATIVE_ABSENCE
     assert observation.missing_complete_snapshots == 2
     assert observation.closed_at == T2
     assert canonical is not None
@@ -169,6 +171,7 @@ async def test_repeated_missing_snapshot_preserves_closure_time_and_bounded_coun
     observation = await _only_observation(vacancies, vacancy.id)
     canonical = await vacancies.get(vacancy.id)
     assert observation.status is VacancyStatus.CLOSED
+    assert observation.closure_evidence is VacancyClosureEvidence.AUTHORITATIVE_ABSENCE
     assert observation.missing_complete_snapshots == 2
     assert observation.closed_at == T2
     assert canonical is not None
@@ -198,6 +201,7 @@ async def test_closed_observation_reopens_in_authoritative_snapshot(database) ->
     assert observation.status is VacancyStatus.ACTIVE
     assert observation.missing_complete_snapshots == 0
     assert observation.closed_at is None
+    assert observation.closure_evidence is VacancyClosureEvidence.UNKNOWN
     assert observation.title == "Reappeared"
     assert canonical is not None
     assert canonical.status is VacancyStatus.ACTIVE
@@ -597,6 +601,9 @@ async def test_all_owned_trustworthy_observations_close_shared_canonical(
     assert canonical.closed_at == T2
     assert {item.status for item in observations} == {VacancyStatus.CLOSED}
     assert {item.closed_at for item in observations} == {T2}
+    assert {item.closure_evidence for item in observations} == {
+        VacancyClosureEvidence.AUTHORITATIVE_ABSENCE
+    }
 
 
 @pytest.mark.asyncio
@@ -706,6 +713,7 @@ async def test_positive_closed_row_closes_observation_and_canonical(database) ->
         first_seen_at=T0,
         last_seen_at=T1,
         status=VacancyStatus.CLOSED,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
     )
     await companies.add(company)
     await _persist(
@@ -727,6 +735,7 @@ async def test_positive_closed_row_closes_observation_and_canonical(database) ->
     assert observation.status is VacancyStatus.CLOSED
     assert observation.closed_at == T1
     assert observation.missing_complete_snapshots == 0
+    assert observation.closure_evidence is VacancyClosureEvidence.PROVIDER_EXPLICIT
     assert canonical is not None
     assert canonical.status is VacancyStatus.CLOSED
     assert canonical.closed_at == T1
@@ -739,6 +748,7 @@ async def test_positive_closed_row_closes_observation_and_canonical(database) ->
         first_seen_at=T0,
         last_seen_at=T2,
         status=VacancyStatus.CLOSED,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
     )
     await _persist(
         persistence,
@@ -749,8 +759,236 @@ async def test_positive_closed_row_closes_observation_and_canonical(database) ->
     repeated_observation = await _only_observation(vacancies, active.id)
     repeated_canonical = await vacancies.get(active.id)
     assert repeated_observation.closed_at == T1
+    assert (
+        repeated_observation.closure_evidence
+        is VacancyClosureEvidence.PROVIDER_EXPLICIT
+    )
     assert repeated_canonical is not None
     assert repeated_canonical.closed_at == T1
+
+    stale_active = make_vacancy(
+        company.id,
+        vacancy_id=active.id,
+        source=VacancySource.HH,
+        source_job_id=active.source_job_id,
+        first_seen_at=T0,
+        last_seen_at=T1,
+    )
+    stale = await _persist(
+        persistence,
+        company,
+        _result((stale_active,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T1,
+    )
+    after_stale = await _only_observation(vacancies, active.id)
+    assert stale.applied is False
+    assert after_stale.closed_at == T1
+    assert after_stale.closure_evidence is VacancyClosureEvidence.PROVIDER_EXPLICIT
+
+
+@pytest.mark.asyncio
+async def test_unknown_positive_closed_row_cannot_close_canonical(database) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    company = make_company(ats_type=ATSType.HH, ats_identifier="hh-unknown")
+    ambiguous = make_vacancy(
+        company.id,
+        source=VacancySource.HH,
+        source_job_id="ambiguous-closed",
+        status=VacancyStatus.CLOSED,
+        closed_at=T1,
+    )
+    await companies.add(company)
+
+    await _persist(
+        persistence,
+        company,
+        _result((ambiguous,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T1,
+    )
+
+    observation = await _only_observation(vacancies, ambiguous.id)
+    canonical = await vacancies.get(ambiguous.id)
+    assert observation.status is VacancyStatus.CLOSED
+    assert observation.closed_at == T1
+    assert observation.closure_evidence is VacancyClosureEvidence.UNKNOWN
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert canonical.closed_at is None
+
+
+@pytest.mark.asyncio
+async def test_generic_active_upsert_cannot_reopen_authoritative_closure(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    company = make_company(ats_type=ATSType.HH, ats_identifier="generic-reopen")
+    explicit = make_vacancy(
+        company.id,
+        source=VacancySource.HH,
+        status=VacancyStatus.CLOSED,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
+    )
+    await companies.add(company)
+    await _persist(
+        persistence,
+        company,
+        _result((explicit,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T1,
+    )
+    direct_active = make_vacancy(
+        company.id,
+        vacancy_id=explicit.id,
+        source=VacancySource.HH,
+        source_job_id=explicit.source_job_id,
+        title="Metadata refreshed outside collection",
+        first_seen_at=T0,
+        last_seen_at=T2,
+    )
+
+    await vacancies.upsert_many((direct_active,))
+
+    canonical = await vacancies.get(explicit.id)
+    observation = await _only_observation(vacancies, explicit.id)
+    assert canonical is not None
+    assert canonical.title == "Metadata refreshed outside collection"
+    assert canonical.status is VacancyStatus.CLOSED
+    assert canonical.closed_at == T1
+    assert observation.status is VacancyStatus.CLOSED
+    assert observation.closed_at == T1
+    assert observation.closure_evidence is VacancyClosureEvidence.PROVIDER_EXPLICIT
+
+
+@pytest.mark.asyncio
+async def test_unknown_legacy_closure_requires_two_new_authoritative_misses(
+    database,
+) -> None:
+    (
+        session_factory,
+        _,
+        vacancies,
+        persistence,
+        company,
+        vacancy,
+    ) = await _setup_active_observation(database)
+    async with session_factory() as session, session.begin():
+        observation = await session.scalar(select(VacancyObservationRecord))
+        assert observation is not None
+        observation.status = VacancyStatus.CLOSED.value
+        observation.closed_at = T0
+        observation.closure_evidence = VacancyClosureEvidence.UNKNOWN.value
+        observation.missing_complete_snapshots = 2
+
+    await _persist(persistence, company, _result(), T1)
+    after_first = await _only_observation(vacancies, vacancy.id)
+    assert after_first.status is VacancyStatus.ACTIVE
+    assert after_first.closed_at is None
+    assert after_first.missing_complete_snapshots == 1
+    assert after_first.closure_evidence is VacancyClosureEvidence.UNKNOWN
+
+    await _persist(persistence, company, _result(), T2)
+    after_second = await _only_observation(vacancies, vacancy.id)
+    canonical = await vacancies.get(vacancy.id)
+    assert after_second.status is VacancyStatus.CLOSED
+    assert after_second.closed_at == T2
+    assert after_second.closure_evidence is VacancyClosureEvidence.AUTHORITATIVE_ABSENCE
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_active_counter_requires_two_new_authoritative_misses(
+    database,
+) -> None:
+    (
+        session_factory,
+        _,
+        vacancies,
+        persistence,
+        company,
+        vacancy,
+    ) = await _setup_active_observation(database)
+    async with session_factory() as session, session.begin():
+        observation = await session.scalar(select(VacancyObservationRecord))
+        assert observation is not None
+        observation.missing_complete_snapshots = 2
+
+    await _persist(persistence, company, _result(), T1)
+    after_first = await _only_observation(vacancies, vacancy.id)
+    assert after_first.status is VacancyStatus.ACTIVE
+    assert after_first.missing_complete_snapshots == 1
+    assert after_first.closure_evidence is VacancyClosureEvidence.UNKNOWN
+
+    await _persist(persistence, company, _result(), T2)
+    after_second = await _only_observation(vacancies, vacancy.id)
+    assert after_second.status is VacancyStatus.CLOSED
+    assert after_second.missing_complete_snapshots == 2
+    assert after_second.closure_evidence is VacancyClosureEvidence.AUTHORITATIVE_ABSENCE
+
+
+@pytest.mark.asyncio
+async def test_authoritative_and_unknown_closed_observations_keep_canonical_active(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    hh_company = make_company(
+        name="Authoritative",
+        ats_type=ATSType.HH,
+        ats_identifier="mixed-hh",
+    )
+    lever_company = make_company(
+        name="Ambiguous",
+        ats_type=ATSType.LEVER,
+        ats_identifier="mixed-lever",
+    )
+    shared_url = "https://example.com/jobs/mixed-evidence"
+    explicit = make_vacancy(
+        hh_company.id,
+        source=VacancySource.HH,
+        source_job_id="mixed-hh",
+        url=shared_url,
+        status=VacancyStatus.CLOSED,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
+    )
+    ambiguous = make_vacancy(
+        lever_company.id,
+        source=VacancySource.LEVER,
+        source_job_id="mixed-lever",
+        url=shared_url,
+        status=VacancyStatus.CLOSED,
+        closed_at=T1,
+    )
+    await companies.add(hh_company)
+    await companies.add(lever_company)
+    await _persist(
+        persistence,
+        hh_company,
+        _result((explicit,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T1,
+    )
+    await _persist(
+        persistence,
+        lever_company,
+        _result((ambiguous,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T1,
+    )
+
+    canonical = await vacancies.get(explicit.id)
+    observations = await vacancies.list_observations(explicit.id)
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.ACTIVE
+    assert {item.closure_evidence for item in observations} == {
+        VacancyClosureEvidence.PROVIDER_EXPLICIT,
+        VacancyClosureEvidence.UNKNOWN,
+    }
 
 
 @pytest.mark.asyncio
@@ -815,6 +1053,7 @@ async def test_reclosure_after_positive_reopening_uses_new_timestamp(database) -
     canonical = await vacancies.get(vacancy.id)
     assert observation.status is VacancyStatus.CLOSED
     assert observation.closed_at == t5
+    assert observation.closure_evidence is VacancyClosureEvidence.AUTHORITATIVE_ABSENCE
     assert canonical is not None
     assert canonical.status is VacancyStatus.CLOSED
     assert canonical.closed_at == t5
@@ -1002,8 +1241,51 @@ async def test_aggregation_failure_rolls_back_observation_canonical_and_health(
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_aggregation_batches_all_affected_vacancies(database) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    company = make_company(ats_identifier="batching")
+    vacancy_count = repositories._LIFECYCLE_AGGREGATION_BATCH_SIZE + 5
+    source_vacancies = tuple(
+        make_vacancy(company.id, source_job_id=f"batch-{index}")
+        for index in range(vacancy_count)
+    )
+    await companies.add(company)
+    await _persist(persistence, company, _result(source_vacancies), T0)
+
+    await _persist(persistence, company, _result(), T1)
+    await _persist(persistence, company, _result(), T2)
+
+    async with session_factory() as session:
+        canonical_states = (
+            await session.scalars(select(JobVacancyRecord.status))
+        ).all()
+        observation_states = (
+            await session.execute(
+                select(
+                    VacancyObservationRecord.status,
+                    VacancyObservationRecord.closure_evidence,
+                )
+            )
+        ).all()
+    assert len(canonical_states) == vacancy_count
+    assert set(canonical_states) == {VacancyStatus.CLOSED.value}
+    assert len(observation_states) == vacancy_count
+    assert set(observation_states) == {
+        (
+            VacancyStatus.CLOSED.value,
+            VacancyClosureEvidence.AUTHORITATIVE_ABSENCE.value,
+        )
+    }
+    assert await vacancies.list_active() == ()
+
+
+@pytest.mark.asyncio
 async def test_separate_persistence_instances_serialize_shared_canonical_updates(
     database,
+    monkeypatch,
 ) -> None:
     _, session_factory = database
     companies = SQLAlchemyCompanyRepository(session_factory)
@@ -1034,11 +1316,50 @@ async def test_separate_persistence_instances_serialize_shared_canonical_updates
     await _persist(persistence_b, company_b, _result((vacancy_b,)), T0)
     await _persist(persistence_a, company_a, _result(), T1)
     await _persist(persistence_b, company_b, _result(), T1)
+    first_aggregation_entered = asyncio.Event()
+    release_first_transaction = asyncio.Event()
+    second_claim_started = asyncio.Event()
+    original_aggregate = repositories._aggregate_canonical_lifecycle
+    original_claim = repositories._claim_collection_success
 
-    result_a, result_b = await asyncio.gather(
-        _persist(persistence_a, company_a, _result(), T2),
-        _persist(persistence_b, company_b, _result(), T2),
+    async def controlled_aggregate(session, vacancy_ids, transition_at) -> None:
+        if transition_at == T2 and not first_aggregation_entered.is_set():
+            first_aggregation_entered.set()
+            await asyncio.wait_for(release_first_transaction.wait(), timeout=2)
+        await original_aggregate(session, vacancy_ids, transition_at)
+
+    async def observed_claim(
+        session,
+        company_id,
+        checked_at,
+        *,
+        complete_snapshot,
+    ):
+        if company_id == company_b.id and checked_at == T2:
+            second_claim_started.set()
+        return await original_claim(
+            session,
+            company_id,
+            checked_at,
+            complete_snapshot=complete_snapshot,
+        )
+
+    monkeypatch.setattr(
+        repositories,
+        "_aggregate_canonical_lifecycle",
+        controlled_aggregate,
     )
+    monkeypatch.setattr(repositories, "_claim_collection_success", observed_claim)
+    task_a = asyncio.create_task(_persist(persistence_a, company_a, _result(), T2))
+    await asyncio.wait_for(first_aggregation_entered.wait(), timeout=1)
+    task_b = asyncio.create_task(_persist(persistence_b, company_b, _result(), T2))
+    try:
+        await asyncio.wait_for(second_claim_started.wait(), timeout=1)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task_b), timeout=0.05)
+    finally:
+        release_first_transaction.set()
+    result_a, result_b = await asyncio.gather(task_a, task_b)
 
     canonical = await vacancies.get(vacancy_a.id)
     observations = await vacancies.list_observations(vacancy_a.id)
@@ -1048,6 +1369,15 @@ async def test_separate_persistence_instances_serialize_shared_canonical_updates
     assert canonical.status is VacancyStatus.CLOSED
     assert canonical.closed_at == T2
     assert {item.status for item in observations} == {VacancyStatus.CLOSED}
+    assert {item.closure_evidence for item in observations} == {
+        VacancyClosureEvidence.AUTHORITATIVE_ABSENCE
+    }
+    stored_a = await companies.get(company_a.id)
+    stored_b = await companies.get(company_b.id)
+    assert stored_a is not None
+    assert stored_b is not None
+    assert stored_a.last_complete_snapshot_at == T2
+    assert stored_b.last_complete_snapshot_at == T2
 
 
 @pytest.mark.asyncio

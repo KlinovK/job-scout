@@ -116,6 +116,16 @@ class VacancyObservationRecord(Base):
             "missing_complete_snapshots >= 0",
             name="ck_vacancy_observations_missing_nonnegative",
         ),
+        CheckConstraint(
+            "closure_evidence IN "
+            "('unknown', 'provider_explicit', 'authoritative_absence')",
+            name="ck_vacancy_observations_closure_evidence",
+        ),
+        CheckConstraint(
+            "closure_evidence = 'unknown' OR "
+            "(status = 'closed' AND closed_at IS NOT NULL)",
+            name="ck_vacancy_observations_authoritative_closure_shape",
+        ),
         Index(
             "uq_vacancy_observations_owned_source_identity",
             "source_company_id",
@@ -169,6 +179,11 @@ class VacancyObservationRecord(Base):
         default="active",
     )
     closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    closure_evidence: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="unknown",
+    )
     missing_complete_snapshots: Mapped[int] = mapped_column(
         Integer,
         nullable=False,

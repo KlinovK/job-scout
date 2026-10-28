@@ -60,8 +60,9 @@ Eligible authoritative snapshots reconcile observations owned by that exact sour
 3. A second consecutive eligible miss closes the observation.
 4. A valid positive active row reopens its observation even when its collection
    is incomplete or rolling-window, because presence is positive evidence.
-5. A provider's explicit closed row records trustworthy closure using its
-   timestamp or the accepted collection timestamp.
+5. A verified provider's explicit closed row records `provider_explicit`
+   evidence using its timestamp or the accepted collection timestamp.
+6. The second eligible absence records `authoritative_absence` evidence.
 
 Filtered subsets, rolling windows, incomplete pagination, malformed payloads,
 and failed runs cannot advance absence state. `last_complete_snapshot_at` is
@@ -69,15 +70,21 @@ updated only by an eligible snapshot.
 
 Canonical lifecycle is derived atomically from all linked observations affected
 by an accepted collection. Any active observation, NULL-owned legacy
-observation, observation without trustworthy closure time, or empty observation
-set keeps the canonical vacancy active. The canonical vacancy closes only when
-every linked observation is owned, closed, and timestamped. Reopening clears
-canonical `closed_at`; repeated closure preserves it; reclosure records a new
-accepted transition time without timestamp regression.
+observation, observation without trustworthy closure time, observation whose
+closure evidence is `unknown`, or empty observation set keeps the canonical
+vacancy active. The canonical vacancy closes only when every linked observation
+is owned, closed, timestamped, and has `provider_explicit` or
+`authoritative_absence` evidence. Reopening clears canonical `closed_at`;
+repeated closure preserves it; reclosure records a new accepted transition time
+without timestamp regression. Aggregation processes affected canonical IDs in
+fixed SQLite-safe batches while loading each batch's complete observation set.
 
-The lifecycle data migration only reopens unsafe legacy closed canonical rows.
-It never closes an active row, invents ownership or timestamps, or modifies
-observation history.
+Migration 0008 marks all historical observation evidence `unknown` because the
+older schema did not persist authority. It reopens historical closed canonical
+rows without changing observation status, timestamps, ownership, classifications,
+or active canonical rows. Generic vacancy upserts preserve metadata but cannot
+create authoritative evidence or close canonical lifecycle; only accepted
+collection persistence can do so.
 
 ## Classification and Queries
 
@@ -91,7 +98,9 @@ lifecycle fields. Application services expose these workflows through
 
 SQLite is the only supported database. Its writer serialization combines with
 the per-company stale guard and atomic aggregation transaction. Lock contention
-fails the collection without a partial commit. PostgreSQL support would require
+blocks or fails the collection without a partial commit; deterministic integration
+tests hold one writer through aggregation while a second persistence instance
+attempts its write. PostgreSQL support would require
 additional canonical-row concurrency controls and is not currently implemented.
 
 There is no FastAPI service or LLM provider in the implemented Core. These are not assumed by the current architecture.

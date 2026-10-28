@@ -20,7 +20,12 @@ from job_search.application.models import (
     SourceCollectionResult,
 )
 from job_search.domain.canonicalization import normalize_canonical_url
-from job_search.domain.enums import RemotePolicy, VacancySource, VacancyStatus
+from job_search.domain.enums import (
+    RemotePolicy,
+    VacancyClosureEvidence,
+    VacancySource,
+    VacancyStatus,
+)
 from job_search.domain.models import Company, JobVacancy
 from job_search.infrastructure.http import RetryPolicy, Sleep, get_with_retry
 from job_search.infrastructure.sources.hh.dto import (
@@ -187,6 +192,11 @@ class HHSource:
                         VacancyStatus.CLOSED
                         if detail.archived
                         else VacancyStatus.ACTIVE
+                    ),
+                    closure_evidence=(
+                        VacancyClosureEvidence.PROVIDER_EXPLICIT
+                        if detail.archived
+                        else VacancyClosureEvidence.UNKNOWN
                     ),
                     salary=_salary(detail.salary),
                     employment=(detail.employment.name if detail.employment else None),

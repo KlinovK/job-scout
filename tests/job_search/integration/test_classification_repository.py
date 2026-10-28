@@ -5,16 +5,28 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
+from job_search.application.models import (
+    CollectionCoverage,
+    SourceCollectionResult,
+    SourceHealthUpdate,
+)
 from job_search.application.services import ListCandidateVacanciesService
 from job_search.domain.classification import ClassificationDecision
 from job_search.domain.classifier import IOSVacancyClassifier
-from job_search.domain.enums import VacancyStatus
+from job_search.domain.enums import (
+    ATSType,
+    SourceHealthStatus,
+    VacancyClosureEvidence,
+    VacancySource,
+    VacancyStatus,
+)
 from job_search.infrastructure.persistence.sqlalchemy.models import (
     JobVacancyRecord,
     VacancyClassificationRecord,
 )
 from job_search.infrastructure.persistence.sqlalchemy.repositories import (
     SQLAlchemyClassificationRepository,
+    SQLAlchemyCollectionPersistence,
     SQLAlchemyCompanyRepository,
     SQLAlchemyVacancyRepository,
 )
@@ -124,7 +136,7 @@ async def test_active_candidate_filter_runs_before_limit_and_keeps_history(
     companies = SQLAlchemyCompanyRepository(session_factory)
     vacancies = SQLAlchemyVacancyRepository(session_factory)
     classifications = SQLAlchemyClassificationRepository(session_factory)
-    company = make_company()
+    company = make_company(ats_type=ATSType.HH, ats_identifier="candidate-hh")
     await companies.add(company)
     closed = make_vacancy(
         company.id,
@@ -132,15 +144,34 @@ async def test_active_candidate_filter_runs_before_limit_and_keeps_history(
         title="Senior iOS Engineer",
         description="Swift. Remote worldwide.",
         status=VacancyStatus.CLOSED,
-        closed_at=LATER,
+        source=VacancySource.HH,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
     )
     active = make_vacancy(
         company.id,
         source_job_id="active-match",
         title="Senior iOS Engineer",
         description="Swift. Remote worldwide.",
+        source=VacancySource.HH,
     )
-    await vacancies.upsert_many([closed, active])
+    result = SourceCollectionResult(
+        vacancies=(closed, active),
+        coverage=CollectionCoverage.ROLLING_WINDOW,
+        complete=True,
+        raw_count=2,
+        malformed_count=0,
+        pagination_exhausted=True,
+    )
+    await SQLAlchemyCollectionPersistence(session_factory).persist_collection(
+        company.id,
+        result,
+        SourceHealthUpdate(
+            checked_at=LATER,
+            status=SourceHealthStatus.HEALTHY,
+            job_count=2,
+            error_category=None,
+        ),
+    )
     classifier = IOSVacancyClassifier()
     closed_classification = classifier.classify(closed, LATER)
     active_classification = classifier.classify(active, NOW)
@@ -170,6 +201,39 @@ async def test_active_candidate_filter_runs_before_limit_and_keeps_history(
         stored_closed = await session.get(JobVacancyRecord, str(closed.id))
     assert stored_closed is not None
     assert stored_closed.status == VacancyStatus.CLOSED.value
+
+
+@pytest.mark.asyncio
+async def test_unknown_closed_evidence_keeps_candidate_visible(database) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    classifications = SQLAlchemyClassificationRepository(session_factory)
+    company = make_company()
+    vacancy = make_vacancy(
+        company.id,
+        title="Senior iOS Engineer",
+        description="Swift. Remote worldwide.",
+        status=VacancyStatus.CLOSED,
+        closed_at=LATER,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
+    )
+    await companies.add(company)
+    await vacancies.upsert_many((vacancy,))
+    classification = IOSVacancyClassifier().classify(vacancy, LATER)
+    await classifications.upsert_many((classification,))
+
+    candidates = await ListCandidateVacanciesService(
+        companies,
+        vacancies,
+        classifications,
+    ).list_candidates(classification.classifier_version, limit=1)
+
+    assert [candidate.vacancy.id for candidate in candidates] == [vacancy.id]
+    assert candidates[0].vacancy.status is VacancyStatus.ACTIVE
+    assert (
+        candidates[0].observations[0].closure_evidence is VacancyClosureEvidence.UNKNOWN
+    )
 
 
 @pytest.mark.asyncio

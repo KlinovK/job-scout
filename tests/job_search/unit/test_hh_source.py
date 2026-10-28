@@ -12,6 +12,7 @@ from job_search.application.models import CollectionCoverage
 from job_search.domain.enums import (
     ATSType,
     RemotePolicy,
+    VacancyClosureEvidence,
     VacancySource,
     VacancyStatus,
 )
@@ -214,6 +215,9 @@ async def test_hh_preserves_explicit_archived_status() -> None:
         )
 
     assert result.vacancies[0].status is VacancyStatus.CLOSED
+    assert (
+        result.vacancies[0].closure_evidence is VacancyClosureEvidence.PROVIDER_EXPLICIT
+    )
     assert result.reconciliation_eligible is False
 
 

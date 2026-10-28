@@ -1,6 +1,6 @@
 import pytest
 
-from job_search.domain.enums import VacancyStatus
+from job_search.domain.enums import VacancyClosureEvidence, VacancyStatus
 from job_search.infrastructure.configuration import Settings
 from job_search.infrastructure.persistence.sqlalchemy.repositories import (
     SQLAlchemyCompanyRepository,
@@ -36,9 +36,10 @@ async def test_vacancy_sources_displays_canonical_and_observation_lifecycle(
 
     output = capsys.readouterr().out
     assert exit_code == 0
-    assert "Canonical status: closed" in output
-    assert f"Canonical closed at: {LATER.isoformat()}" in output
+    assert "Canonical status: active" in output
+    assert "Canonical closed at: -" in output
     assert f"Source company ID: {company.id}" in output
     assert "Observation status: closed" in output
+    assert f"Closure evidence: {VacancyClosureEvidence.UNKNOWN.value}" in output
     assert f"Observation closed at: {LATER.isoformat()}" in output
     assert "Missing complete snapshots: 0" in output

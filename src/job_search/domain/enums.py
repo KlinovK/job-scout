@@ -41,6 +41,12 @@ class VacancyStatus(StrEnum):
     CLOSED = "closed"
 
 
+class VacancyClosureEvidence(StrEnum):
+    UNKNOWN = "unknown"
+    PROVIDER_EXPLICIT = "provider_explicit"
+    AUTHORITATIVE_ABSENCE = "authoritative_absence"
+
+
 class SourceHealthStatus(StrEnum):
     HEALTHY = "healthy"
     EMPTY = "empty"
