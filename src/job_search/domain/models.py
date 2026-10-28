@@ -8,6 +8,7 @@ from job_search.domain.enums import (
     RemotePolicy,
     SourceHealthStatus,
     VacancyClosureEvidence,
+    VacancyLifecycleProvenance,
     VacancySource,
     VacancyStatus,
 )
@@ -137,6 +138,9 @@ class VacancyObservation:
     closed_at: datetime | None = None
     missing_complete_snapshots: int = 0
     closure_evidence: VacancyClosureEvidence = VacancyClosureEvidence.UNKNOWN
+    lifecycle_provenance: VacancyLifecycleProvenance = (
+        VacancyLifecycleProvenance.UNKNOWN
+    )
 
     def __post_init__(self) -> None:
         if not self.source_job_id.strip():

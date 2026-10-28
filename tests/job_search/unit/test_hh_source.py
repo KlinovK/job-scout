@@ -127,6 +127,70 @@ async def test_hh_normalizes_full_vacancy_and_deduplicates_queries() -> None:
     assert vacancy.salary == "from 300000 to 400000 RUR gross"
     assert vacancy.experience == "3–6 years"
     assert vacancy.canonical_url == "https://hh.ru/vacancy/123?from=search"
+    assert vacancy.status is VacancyStatus.ACTIVE
+    assert vacancy.closure_evidence is VacancyClosureEvidence.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_hh_missing_archived_field_defaults_to_active() -> None:
+    detail = _detail()
+    del detail["archived"]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/vacancies":
+            return httpx.Response(200, json=_search(["123"]))
+        return httpx.Response(200, json=detail)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await HHSource(client, oauth_token="token", max_retries=0).collect(
+            _company(), OBSERVED_AT
+        )
+
+    assert result.malformed_count == 0
+    assert result.vacancies[0].status is VacancyStatus.ACTIVE
+    assert result.vacancies[0].closure_evidence is VacancyClosureEvidence.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "archived",
+    ["true", "false", "yes", "no", 1, 0, None, [], {}],
+    ids=(
+        "true-string",
+        "false-string",
+        "yes-string",
+        "no-string",
+        "one",
+        "zero",
+        "null",
+        "list",
+        "object",
+    ),
+)
+async def test_hh_malformed_archived_values_cannot_create_explicit_closure(
+    archived: object,
+) -> None:
+    malformed = _detail("malformed")
+    malformed["archived"] = archived
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/vacancies":
+            return httpx.Response(200, json=_search(["123", "malformed"]))
+        if request.url.path == "/vacancies/123":
+            return httpx.Response(200, json=_detail())
+        return httpx.Response(200, json=malformed)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await HHSource(client, oauth_token="token", max_retries=0).collect(
+            _company(), OBSERVED_AT
+        )
+
+    assert result.malformed_count == 1
+    assert [item.source_job_id for item in result.vacancies] == ["123"]
+    assert all(
+        item.closure_evidence is not VacancyClosureEvidence.PROVIDER_EXPLICIT
+        for item in result.vacancies
+    )
 
 
 @pytest.mark.asyncio

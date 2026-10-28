@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 
 class HHNamedValueDTO(BaseModel):
@@ -57,4 +57,4 @@ class HHVacancyDTO(BaseModel):
     schedule: HHNamedValueDTO | None = None
     work_format: list[HHNamedValueDTO] = Field(default_factory=list)
     published_at: datetime
-    archived: bool = False
+    archived: StrictBool = False

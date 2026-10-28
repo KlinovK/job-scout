@@ -34,6 +34,8 @@ Implemented provider adapters include Greenhouse, Lever, Ashby, Recruitee, hh.ru
 
 - Greenhouse, Lever, Ashby, and Recruitee can represent full-board snapshots.
 - hh.ru and AgileFluent are rolling-window sources and are not authoritative for absence reconciliation.
+- hh.ru provider-explicit closure requires a strict JSON boolean `archived` value;
+  coercible strings, numbers, null, and container values are malformed rows.
 
 Adapters return `SourceCollectionResult`, which records coverage, completeness, raw and malformed counts, and pagination exhaustion. A result is reconciliation-eligible only when it is a complete full-board snapshot with no malformed entries and exhausted pagination. Empty results are valid only when the adapter has positively established an authoritative empty snapshot; failures and malformed data are not empty success.
 
@@ -69,22 +71,32 @@ and failed runs cannot advance absence state. `last_complete_snapshot_at` is
 updated only by an eligible snapshot.
 
 Canonical lifecycle is derived atomically from all linked observations affected
-by an accepted collection. Any active observation, NULL-owned legacy
+by an accepted collection. Observation `lifecycle_provenance` distinguishes
+accepted collection state from non-authoritative generic repository history.
+Generic observations are retained for identity and provenance but do not reopen
+or close an existing canonical vacancy. Legacy `unknown` provenance remains
+conservative and participates in lifecycle aggregation, so it cannot be mistaken
+for an ignorable generic write. Any authoritative ACTIVE observation, NULL-owned
 observation, observation without trustworthy closure time, observation whose
-closure evidence is `unknown`, or empty observation set keeps the canonical
-vacancy active. The canonical vacancy closes only when every linked observation
-is owned, closed, timestamped, and has `provider_explicit` or
-`authoritative_absence` evidence. Reopening clears canonical `closed_at`;
-repeated closure preserves it; reclosure records a new accepted transition time
-without timestamp regression. Aggregation processes affected canonical IDs in
-fixed SQLite-safe batches while loading each batch's complete observation set.
+closure evidence is `unknown`, or empty authoritative observation set keeps the
+canonical vacancy active. The canonical vacancy closes only when every
+lifecycle-participating observation is closed, timestamped, and has
+`provider_explicit` or `authoritative_absence` evidence, and every linked
+observation is owned. Reopening clears canonical `closed_at`; repeated closure
+preserves it; reclosure records a new accepted transition time without timestamp
+regression. Aggregation processes affected canonical IDs in fixed SQLite-safe
+batches while loading each batch's complete observation set.
 
 Migration 0008 marks all historical observation evidence `unknown` because the
 older schema did not persist authority. It reopens historical closed canonical
 rows without changing observation status, timestamps, ownership, classifications,
-or active canonical rows. Generic vacancy upserts preserve metadata but cannot
-create authoritative evidence or close canonical lifecycle; only accepted
-collection persistence can do so.
+or active canonical rows. Migration 0009 conservatively marks existing lifecycle
+provenance `unknown`; it does not guess whether older ACTIVE observations came
+from accepted collections or generic writes. Generic vacancy upserts preserve
+metadata and source identity but cannot create lifecycle authority, close a
+canonical vacancy, or reopen an authoritative closure. A later accepted positive
+collection promotes the matching observation to `accepted_collection` and can
+legitimately reopen the canonical vacancy.
 
 ## Classification and Queries
 

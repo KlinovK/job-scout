@@ -126,6 +126,11 @@ class VacancyObservationRecord(Base):
             "(status = 'closed' AND closed_at IS NOT NULL)",
             name="ck_vacancy_observations_authoritative_closure_shape",
         ),
+        CheckConstraint(
+            "lifecycle_provenance IN "
+            "('unknown', 'generic_upsert', 'accepted_collection')",
+            name="ck_vacancy_observations_lifecycle_provenance",
+        ),
         Index(
             "uq_vacancy_observations_owned_source_identity",
             "source_company_id",
@@ -180,6 +185,11 @@ class VacancyObservationRecord(Base):
     )
     closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     closure_evidence: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="unknown",
+    )
+    lifecycle_provenance: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         default="unknown",

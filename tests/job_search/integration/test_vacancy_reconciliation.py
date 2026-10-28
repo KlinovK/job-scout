@@ -15,6 +15,7 @@ from job_search.domain.enums import (
     ATSType,
     SourceHealthStatus,
     VacancyClosureEvidence,
+    VacancyLifecycleProvenance,
     VacancySource,
     VacancyStatus,
 )
@@ -862,6 +863,154 @@ async def test_generic_active_upsert_cannot_reopen_authoritative_closure(
     assert observation.status is VacancyStatus.CLOSED
     assert observation.closed_at == T1
     assert observation.closure_evidence is VacancyClosureEvidence.PROVIDER_EXPLICIT
+    assert (
+        observation.lifecycle_provenance
+        is VacancyLifecycleProvenance.ACCEPTED_COLLECTION
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_accepted_collection_rolls_back_generic_authority_promotion(
+    database,
+    monkeypatch,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    hh_company = make_company(
+        name="HH",
+        ats_type=ATSType.HH,
+        ats_identifier="rollback-hh",
+    )
+    greenhouse_company = make_company(
+        name="Greenhouse",
+        ats_identifier="rollback-greenhouse",
+    )
+    shared_url = "https://example.com/jobs/rollback-authority"
+    closed = make_vacancy(
+        hh_company.id,
+        source=VacancySource.HH,
+        source_job_id="rollback-hh",
+        url=shared_url,
+        status=VacancyStatus.CLOSED,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
+    )
+    generic_active = make_vacancy(
+        greenhouse_company.id,
+        source=VacancySource.GREENHOUSE,
+        source_job_id="rollback-greenhouse",
+        url=shared_url,
+    )
+    await companies.add(hh_company)
+    await companies.add(greenhouse_company)
+    await _persist(
+        persistence,
+        hh_company,
+        _result((closed,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T0,
+    )
+    await vacancies.upsert_many((generic_active,))
+
+    async def fail_aggregation(session, vacancy_ids, transition_at) -> None:
+        del session, vacancy_ids, transition_at
+        raise RuntimeError("forced aggregation failure")
+
+    monkeypatch.setattr(
+        repositories,
+        "_aggregate_canonical_lifecycle",
+        fail_aggregation,
+    )
+
+    with pytest.raises(RuntimeError, match="forced aggregation failure"):
+        await _persist(
+            persistence,
+            greenhouse_company,
+            _result((generic_active,)),
+            T1,
+        )
+
+    canonical = await vacancies.get(closed.id)
+    observations = await vacancies.list_observations(closed.id)
+    stored_greenhouse = await companies.get(greenhouse_company.id)
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+    assert canonical.closed_at == T0
+    assert {
+        observation.discovered_via: observation.lifecycle_provenance
+        for observation in observations
+    } == {
+        VacancySource.HH: VacancyLifecycleProvenance.ACCEPTED_COLLECTION,
+        VacancySource.GREENHOUSE: VacancyLifecycleProvenance.GENERIC_UPSERT,
+    }
+    assert stored_greenhouse is not None
+    assert stored_greenhouse.last_success_at is None
+
+
+@pytest.mark.asyncio
+async def test_generic_closed_observation_cannot_close_or_timestamp_canonical(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    greenhouse_company = make_company(
+        name="Generic Greenhouse",
+        ats_identifier="generic-closed-greenhouse",
+    )
+    hh_company = make_company(
+        name="Accepted HH",
+        ats_type=ATSType.HH,
+        ats_identifier="accepted-closed-hh",
+    )
+    shared_url = "https://example.com/jobs/generic-closed-authority"
+    generic_closed = make_vacancy(
+        greenhouse_company.id,
+        source=VacancySource.GREENHOUSE,
+        source_job_id="generic-closed",
+        url=shared_url,
+        status=VacancyStatus.CLOSED,
+        closed_at=T3,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
+    )
+    accepted_closed = make_vacancy(
+        hh_company.id,
+        source=VacancySource.HH,
+        source_job_id="accepted-closed",
+        url=shared_url,
+        status=VacancyStatus.CLOSED,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
+    )
+    await companies.add(greenhouse_company)
+    await companies.add(hh_company)
+
+    await vacancies.upsert_many((generic_closed,))
+
+    before_accepted_collection = await vacancies.get(generic_closed.id)
+    assert before_accepted_collection is not None
+    assert before_accepted_collection.status is VacancyStatus.ACTIVE
+    assert before_accepted_collection.closed_at is None
+
+    await _persist(
+        persistence,
+        hh_company,
+        _result((accepted_closed,), coverage=CollectionCoverage.ROLLING_WINDOW),
+        T1,
+    )
+
+    canonical = await vacancies.get(generic_closed.id)
+    observations = await vacancies.list_observations(generic_closed.id)
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+    assert canonical.closed_at == T1
+    assert {
+        observation.discovered_via: observation.lifecycle_provenance
+        for observation in observations
+    } == {
+        VacancySource.GREENHOUSE: VacancyLifecycleProvenance.GENERIC_UPSERT,
+        VacancySource.HH: VacancyLifecycleProvenance.ACCEPTED_COLLECTION,
+    }
 
 
 @pytest.mark.asyncio

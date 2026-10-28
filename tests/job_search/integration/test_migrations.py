@@ -97,6 +97,7 @@ def test_initial_migration_creates_constraints_and_indexes(
         "closed_at",
         "missing_complete_snapshots",
         "closure_evidence",
+        "lifecycle_provenance",
     } <= observation_columns
     assert {
         "uq_vacancy_observations_owned_source_identity",
@@ -623,3 +624,126 @@ def test_closure_evidence_migration_reopens_ambiguous_legacy_closure(
     assert observations_after == observations_before
     assert evidence == [("unknown",)] * len(observations_before)
     assert classifications == [(cases["ambiguous-timestamped"], "ios-v1")]
+
+
+def test_lifecycle_provenance_migration_preserves_existing_0008_data(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "lifecycle-provenance.db"
+    monkeypatch.setenv(
+        "JOB_SEARCH_DATABASE_URL",
+        f"sqlite+aiosqlite:///{database_path}",
+    )
+    config = Config("alembic.ini")
+    command.upgrade(config, "20261028_0008")
+    company_id = "00000000-0000-0000-0000-000000000001"
+    vacancy_id = "00000000-0000-0000-0000-000000000002"
+    observation_id = "00000000-0000-0000-0000-000000000003"
+    observed_at = "2026-09-17T08:00:00+00:00"
+
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            "INSERT INTO companies "
+            "(id, name, careers_url, ats_type, ats_identifier, priority, enabled, "
+            "created_at, updated_at, provenance) "
+            "VALUES (?, 'Existing', 'https://example.com/careers', 'greenhouse', "
+            "'existing', 10, 1, ?, ?, 'manual')",
+            (company_id, observed_at, observed_at),
+        )
+        connection.execute(
+            "INSERT INTO job_vacancies "
+            "(id, company_id, title, description, remote_policy, url, source, "
+            "source_job_id, first_seen_at, last_seen_at, status) "
+            "VALUES (?, ?, 'iOS Engineer', 'Swift', 'remote', ?, 'greenhouse', "
+            "'job-1', ?, ?, 'active')",
+            (
+                vacancy_id,
+                company_id,
+                "https://example.com/jobs/1",
+                observed_at,
+                observed_at,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO vacancy_observations "
+            "(id, vacancy_id, source_company_id, discovered_via, source_job_id, "
+            "observation_url, title, first_seen_at, last_seen_at, status, "
+            "missing_complete_snapshots, closure_evidence) "
+            "VALUES (?, ?, ?, 'greenhouse', 'job-1', ?, 'iOS Engineer', ?, ?, "
+            "'active', 0, 'unknown')",
+            (
+                observation_id,
+                vacancy_id,
+                company_id,
+                "https://example.com/jobs/1",
+                observed_at,
+                observed_at,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO vacancy_classifications "
+            "(vacancy_id, classifier_version, decision, role_category, seniority, "
+            "ios_relevance, work_mode, relocation, geography, positive_signals, "
+            "warnings, rejection_reasons, classified_at) "
+            "VALUES (?, 'ios-v1', 'match', 'ios', 'senior', 'strong', 'remote', "
+            "'unknown', 'worldwide', '', '', '', ?)",
+            (vacancy_id, observed_at),
+        )
+        before = connection.execute(
+            "SELECT vacancy_id, source_company_id, status, closure_evidence "
+            "FROM vacancy_observations WHERE id = ?",
+            (observation_id,),
+        ).fetchone()
+        connection.commit()
+    finally:
+        connection.close()
+
+    command.upgrade(config, "head")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        after = connection.execute(
+            "SELECT vacancy_id, source_company_id, status, closure_evidence, "
+            "lifecycle_provenance FROM vacancy_observations WHERE id = ?",
+            (observation_id,),
+        ).fetchone()
+        classifications = connection.execute(
+            "SELECT vacancy_id, classifier_version FROM vacancy_classifications"
+        ).fetchall()
+        assert after == (*before, "unknown")
+        assert classifications == [(vacancy_id, "ios-v1")]
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE vacancy_observations "
+                "SET lifecycle_provenance = 'fabricated' WHERE id = ?",
+                (observation_id,),
+            )
+        connection.rollback()
+    finally:
+        connection.close()
+
+    command.downgrade(config, "20261028_0008")
+
+    connection = sqlite3.connect(database_path)
+    try:
+        columns_after_downgrade = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info('vacancy_observations')")
+        }
+        observation_after_downgrade = connection.execute(
+            "SELECT vacancy_id, source_company_id, status, closure_evidence "
+            "FROM vacancy_observations WHERE id = ?",
+            (observation_id,),
+        ).fetchone()
+        classifications_after_downgrade = connection.execute(
+            "SELECT vacancy_id, classifier_version FROM vacancy_classifications"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert "lifecycle_provenance" not in columns_after_downgrade
+    assert observation_after_downgrade == before
+    assert classifications_after_downgrade == [(vacancy_id, "ios-v1")]

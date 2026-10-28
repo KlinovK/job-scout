@@ -34,8 +34,10 @@ These rules apply to all JobScout changes. `AGENTS.md` defines when to read the 
 - Scope observation lifecycle changes to the exact source-company ownership boundary.
 - Preserve the active -> first miss -> second miss/closed lifecycle and authoritative reopen behavior.
 - Derive canonical vacancy lifecycle only from the complete linked observation
-  set inside accepted collection persistence; only persisted provider-explicit or
-  authoritative-absence evidence permits closure, and ambiguous evidence prevents it.
+  set inside accepted collection persistence. Generic-upsert observations remain
+  non-authoritative until an accepted collection confirms them; only persisted
+  provider-explicit or authoritative-absence evidence permits closure, and
+  ambiguous authoritative or legacy evidence prevents it.
 - Make schema changes through Alembic, with upgrade-path tests and isolated databases.
 
 ## Secrets and Runtime State

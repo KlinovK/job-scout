@@ -1,4 +1,8 @@
-from job_search.domain.enums import VacancyClosureEvidence, VacancyStatus
+from job_search.domain.enums import (
+    VacancyClosureEvidence,
+    VacancyLifecycleProvenance,
+    VacancyStatus,
+)
 from job_search.infrastructure.persistence.sqlalchemy.repositories import (
     _mark_observation_missing,
     _mark_observation_present,
@@ -14,7 +18,7 @@ def _observation():
         vacancy,
         str(vacancy.id),
         vacancy.url,
-        allow_authoritative_evidence=False,
+        accepted_collection=False,
     )
 
 
@@ -26,6 +30,10 @@ def test_first_missing_snapshot_keeps_observation_active() -> None:
     assert observation.status == VacancyStatus.ACTIVE.value
     assert observation.missing_complete_snapshots == 1
     assert observation.closed_at is None
+    assert (
+        observation.lifecycle_provenance
+        == VacancyLifecycleProvenance.GENERIC_UPSERT.value
+    )
 
 
 def test_second_missing_snapshot_closes_observation() -> None:
@@ -40,6 +48,10 @@ def test_second_missing_snapshot_closes_observation() -> None:
     assert (
         observation.closure_evidence
         == VacancyClosureEvidence.AUTHORITATIVE_ABSENCE.value
+    )
+    assert (
+        observation.lifecycle_provenance
+        == VacancyLifecycleProvenance.ACCEPTED_COLLECTION.value
     )
 
 
@@ -73,3 +85,7 @@ def test_present_observation_reopens_and_resets_lifecycle() -> None:
     assert observation.missing_complete_snapshots == 0
     assert observation.closed_at is None
     assert observation.closure_evidence == VacancyClosureEvidence.UNKNOWN.value
+    assert (
+        observation.lifecycle_provenance
+        == VacancyLifecycleProvenance.ACCEPTED_COLLECTION.value
+    )

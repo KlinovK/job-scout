@@ -239,6 +239,7 @@ async def _run(
                 )
                 print(f"Observation status: {observation.status.value}")
                 print(f"Closure evidence: {observation.closure_evidence.value}")
+                print(f"Lifecycle provenance: {observation.lifecycle_provenance.value}")
                 observation_closed_at = (
                     observation.closed_at.isoformat() if observation.closed_at else "-"
                 )

@@ -1,6 +1,10 @@
 import pytest
 
-from job_search.domain.enums import VacancyClosureEvidence, VacancyStatus
+from job_search.domain.enums import (
+    VacancyClosureEvidence,
+    VacancyLifecycleProvenance,
+    VacancyStatus,
+)
 from job_search.infrastructure.configuration import Settings
 from job_search.infrastructure.persistence.sqlalchemy.repositories import (
     SQLAlchemyCompanyRepository,
@@ -41,5 +45,9 @@ async def test_vacancy_sources_displays_canonical_and_observation_lifecycle(
     assert f"Source company ID: {company.id}" in output
     assert "Observation status: closed" in output
     assert f"Closure evidence: {VacancyClosureEvidence.UNKNOWN.value}" in output
+    assert (
+        f"Lifecycle provenance: {VacancyLifecycleProvenance.GENERIC_UPSERT.value}"
+        in output
+    )
     assert f"Observation closed at: {LATER.isoformat()}" in output
     assert "Missing complete snapshots: 0" in output

@@ -47,6 +47,12 @@ class VacancyClosureEvidence(StrEnum):
     AUTHORITATIVE_ABSENCE = "authoritative_absence"
 
 
+class VacancyLifecycleProvenance(StrEnum):
+    UNKNOWN = "unknown"
+    GENERIC_UPSERT = "generic_upsert"
+    ACCEPTED_COLLECTION = "accepted_collection"
+
+
 class SourceHealthStatus(StrEnum):
     HEALTHY = "healthy"
     EMPTY = "empty"

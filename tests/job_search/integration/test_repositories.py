@@ -12,6 +12,7 @@ from job_search.domain.enums import (
     ATSType,
     SourceHealthStatus,
     VacancyClosureEvidence,
+    VacancyLifecycleProvenance,
     VacancySource,
     VacancyStatus,
 )
@@ -135,6 +136,10 @@ async def test_vacancy_create_retrieve_and_update_preserves_identity(database) -
     assert stored.title == "Senior iOS Engineer"
     assert stored.employer_name == "External Employer"
     assert await vacancies.get(original.id) == stored
+    observations = await vacancies.list_observations(original.id)
+    assert observations[0].lifecycle_provenance is (
+        VacancyLifecycleProvenance.GENERIC_UPSERT
+    )
 
 
 @pytest.mark.asyncio
@@ -169,6 +174,10 @@ async def test_generic_closed_upsert_preserves_metadata_without_authority(
     assert observations[0].status is VacancyStatus.ACTIVE
     assert observations[0].closed_at is None
     assert observations[0].closure_evidence is VacancyClosureEvidence.UNKNOWN
+    assert (
+        observations[0].lifecycle_provenance
+        is VacancyLifecycleProvenance.GENERIC_UPSERT
+    )
 
 
 @pytest.mark.asyncio

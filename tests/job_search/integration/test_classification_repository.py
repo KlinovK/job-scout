@@ -17,6 +17,7 @@ from job_search.domain.enums import (
     ATSType,
     SourceHealthStatus,
     VacancyClosureEvidence,
+    VacancyLifecycleProvenance,
     VacancySource,
     VacancyStatus,
 )
@@ -201,6 +202,173 @@ async def test_active_candidate_filter_runs_before_limit_and_keeps_history(
         stored_closed = await session.get(JobVacancyRecord, str(closed.id))
     assert stored_closed is not None
     assert stored_closed.status == VacancyStatus.CLOSED.value
+
+
+@pytest.mark.asyncio
+async def test_generic_cross_source_presence_requires_accepted_collection_to_reopen(
+    database,
+) -> None:
+    _, session_factory = database
+    companies = SQLAlchemyCompanyRepository(session_factory)
+    vacancies = SQLAlchemyVacancyRepository(session_factory)
+    classifications = SQLAlchemyClassificationRepository(session_factory)
+    persistence = SQLAlchemyCollectionPersistence(session_factory)
+    hh_company = make_company(
+        name="HH",
+        ats_type=ATSType.HH,
+        ats_identifier="candidate-hh-authority",
+    )
+    greenhouse_company = make_company(
+        name="Greenhouse",
+        ats_identifier="candidate-greenhouse-authority",
+    )
+    shared_url = "https://example.com/jobs/candidate-authority"
+    closed = make_vacancy(
+        hh_company.id,
+        source=VacancySource.HH,
+        source_job_id="hh-closed",
+        url=shared_url,
+        title="Senior iOS Engineer",
+        description="Swift. Remote worldwide.",
+        status=VacancyStatus.CLOSED,
+        closure_evidence=VacancyClosureEvidence.PROVIDER_EXPLICIT,
+    )
+    greenhouse_active = make_vacancy(
+        greenhouse_company.id,
+        source=VacancySource.GREENHOUSE,
+        source_job_id="greenhouse-active",
+        url=shared_url,
+        title="Senior iOS Engineer",
+        description="Swift. Remote worldwide.",
+    )
+    await companies.add(hh_company)
+    await companies.add(greenhouse_company)
+    await persistence.persist_collection(
+        hh_company.id,
+        SourceCollectionResult(
+            vacancies=(closed,),
+            coverage=CollectionCoverage.ROLLING_WINDOW,
+            complete=True,
+            raw_count=1,
+            malformed_count=0,
+            pagination_exhausted=True,
+        ),
+        SourceHealthUpdate(
+            checked_at=NOW,
+            status=SourceHealthStatus.HEALTHY,
+            job_count=1,
+            error_category=None,
+        ),
+    )
+    classification = IOSVacancyClassifier().classify(closed, NOW)
+    await classifications.upsert_many((classification,))
+
+    first_generic = await vacancies.upsert_many((greenhouse_active,))
+    repeated_generic = await vacancies.upsert_many((greenhouse_active,))
+
+    restarted_vacancies = SQLAlchemyVacancyRepository(session_factory)
+    canonical = await restarted_vacancies.get(closed.id)
+    observations = await restarted_vacancies.list_observations(closed.id)
+    candidates = await ListCandidateVacanciesService(
+        companies,
+        restarted_vacancies,
+        classifications,
+    ).list_candidates(classification.classifier_version, limit=1)
+    assert first_generic.observations_created == 1
+    assert repeated_generic.updated == 1
+    assert len(observations) == 2
+    assert canonical is not None
+    assert canonical.status is VacancyStatus.CLOSED
+    assert candidates == ()
+    assert {
+        observation.discovered_via: observation.lifecycle_provenance
+        for observation in observations
+    } == {
+        VacancySource.HH: VacancyLifecycleProvenance.ACCEPTED_COLLECTION,
+        VacancySource.GREENHOUSE: VacancyLifecycleProvenance.GENERIC_UPSERT,
+    }
+    assert {
+        observation.discovered_via: (
+            observation.status,
+            observation.closure_evidence,
+        )
+        for observation in observations
+    } == {
+        VacancySource.HH: (
+            VacancyStatus.CLOSED,
+            VacancyClosureEvidence.PROVIDER_EXPLICIT,
+        ),
+        VacancySource.GREENHOUSE: (
+            VacancyStatus.ACTIVE,
+            VacancyClosureEvidence.UNKNOWN,
+        ),
+    }
+
+    await persistence.persist_collection(
+        hh_company.id,
+        SourceCollectionResult(
+            vacancies=(closed,),
+            coverage=CollectionCoverage.ROLLING_WINDOW,
+            complete=True,
+            raw_count=1,
+            malformed_count=0,
+            pagination_exhausted=True,
+        ),
+        SourceHealthUpdate(
+            checked_at=LATER,
+            status=SourceHealthStatus.HEALTHY,
+            job_count=1,
+            error_category=None,
+        ),
+    )
+    still_closed = await vacancies.get(closed.id)
+    assert still_closed is not None
+    assert still_closed.status is VacancyStatus.CLOSED
+
+    await persistence.persist_collection(
+        greenhouse_company.id,
+        SourceCollectionResult(
+            vacancies=(greenhouse_active,),
+            coverage=CollectionCoverage.FULL_BOARD,
+            complete=True,
+            raw_count=1,
+            malformed_count=0,
+            pagination_exhausted=True,
+        ),
+        SourceHealthUpdate(
+            checked_at=LATER,
+            status=SourceHealthStatus.HEALTHY,
+            job_count=1,
+            error_category=None,
+        ),
+    )
+
+    reopened = await vacancies.get(closed.id)
+    reopened_observations = await vacancies.list_observations(closed.id)
+    reopened_candidates = await ListCandidateVacanciesService(
+        companies,
+        vacancies,
+        classifications,
+    ).list_candidates(classification.classifier_version, limit=1)
+    assert reopened is not None
+    assert reopened.status is VacancyStatus.ACTIVE
+    assert reopened.closed_at is None
+    assert len(reopened_observations) == 2
+    assert {
+        observation.discovered_via: observation.lifecycle_provenance
+        for observation in reopened_observations
+    } == {
+        VacancySource.HH: VacancyLifecycleProvenance.ACCEPTED_COLLECTION,
+        VacancySource.GREENHOUSE: VacancyLifecycleProvenance.ACCEPTED_COLLECTION,
+    }
+    assert {
+        observation.discovered_via: observation.status
+        for observation in reopened_observations
+    } == {
+        VacancySource.HH: VacancyStatus.CLOSED,
+        VacancySource.GREENHOUSE: VacancyStatus.ACTIVE,
+    }
+    assert [candidate.vacancy.id for candidate in reopened_candidates] == [closed.id]
 
 
 @pytest.mark.asyncio

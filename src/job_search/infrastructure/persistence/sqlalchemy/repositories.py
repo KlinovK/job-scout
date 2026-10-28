@@ -41,6 +41,7 @@ from job_search.domain.enums import (
     RemotePolicy,
     SourceHealthStatus,
     VacancyClosureEvidence,
+    VacancyLifecycleProvenance,
     VacancySource,
     VacancyStatus,
 )
@@ -203,6 +204,7 @@ def _observation_to_domain(record: VacancyObservationRecord) -> VacancyObservati
         closed_at=record.closed_at,
         missing_complete_snapshots=record.missing_complete_snapshots,
         closure_evidence=VacancyClosureEvidence(record.closure_evidence),
+        lifecycle_provenance=VacancyLifecycleProvenance(record.lifecycle_provenance),
     )
 
 
@@ -212,11 +214,11 @@ def _new_observation(
     canonical_url: str,
     observed_at: datetime | None = None,
     *,
-    allow_authoritative_evidence: bool,
+    accepted_collection: bool,
 ) -> VacancyObservationRecord:
     identity = f"{vacancy.company_id}:{vacancy.source.value}:{vacancy.source_job_id}"
     provider_explicit = (
-        allow_authoritative_evidence
+        accepted_collection
         and vacancy.status is VacancyStatus.CLOSED
         and vacancy.closure_evidence is VacancyClosureEvidence.PROVIDER_EXPLICIT
     )
@@ -246,6 +248,11 @@ def _new_observation(
         status=vacancy.status.value,
         closed_at=closed_at,
         closure_evidence=closure_evidence.value,
+        lifecycle_provenance=(
+            VacancyLifecycleProvenance.ACCEPTED_COLLECTION.value
+            if accepted_collection
+            else VacancyLifecycleProvenance.GENERIC_UPSERT.value
+        ),
         missing_complete_snapshots=0,
     )
 
@@ -255,14 +262,18 @@ def _refresh_observation_from_positive_row(
     vacancy: JobVacancy,
     observed_at: datetime | None,
     *,
-    allow_authoritative_evidence: bool,
+    accepted_collection: bool,
 ) -> None:
+    if accepted_collection:
+        observation.lifecycle_provenance = (
+            VacancyLifecycleProvenance.ACCEPTED_COLLECTION.value
+        )
     if vacancy.status is VacancyStatus.ACTIVE:
         _mark_observation_present(observation)
         return
 
     provider_explicit = (
-        allow_authoritative_evidence
+        accepted_collection
         and vacancy.closure_evidence is VacancyClosureEvidence.PROVIDER_EXPLICIT
     )
     if (
@@ -356,7 +367,7 @@ async def _upsert_vacancies(
     vacancies: Sequence[JobVacancy],
     *,
     observed_at: datetime | None,
-    allow_authoritative_evidence: bool,
+    accepted_collection: bool,
 ) -> _VacancyUpsertOutcome:
     created = 0
     updated = 0
@@ -390,12 +401,12 @@ async def _upsert_vacancies(
             observation.title = vacancy.title
             observation.work_location = vacancy.work_location
             observation.last_seen_at = vacancy.last_seen_at
-            if allow_authoritative_evidence:
+            if accepted_collection:
                 _refresh_observation_from_positive_row(
                     observation,
                     vacancy,
                     observed_at,
-                    allow_authoritative_evidence=True,
+                    accepted_collection=True,
                 )
             affected_vacancy_ids.add(record.id)
             if (
@@ -427,7 +438,7 @@ async def _upsert_vacancies(
                     record.id,
                     canonical_url,
                     observed_at,
-                    allow_authoritative_evidence=allow_authoritative_evidence,
+                    accepted_collection=accepted_collection,
                 )
             )
             affected_vacancy_ids.add(record.id)
@@ -447,7 +458,7 @@ async def _upsert_vacancies(
                 record.id,
                 canonical_url,
                 observed_at,
-                allow_authoritative_evidence=allow_authoritative_evidence,
+                accepted_collection=accepted_collection,
             )
         )
         affected_vacancy_ids.add(record.id)
@@ -519,6 +530,9 @@ def _mark_observation_missing(
         and observation.closed_at is not None
         and observation.closure_evidence in _AUTHORITATIVE_CLOSURE_EVIDENCE
     ):
+        observation.lifecycle_provenance = (
+            VacancyLifecycleProvenance.ACCEPTED_COLLECTION.value
+        )
         observation.missing_complete_snapshots = _MISSING_SNAPSHOTS_TO_CLOSE
         return
     if (
@@ -541,6 +555,9 @@ def _mark_observation_missing(
     if observation.missing_complete_snapshots == _MISSING_SNAPSHOTS_TO_CLOSE:
         observation.status = VacancyStatus.CLOSED.value
         observation.closed_at = snapshot_at
+        observation.lifecycle_provenance = (
+            VacancyLifecycleProvenance.ACCEPTED_COLLECTION.value
+        )
         observation.closure_evidence = (
             VacancyClosureEvidence.AUTHORITATIVE_ABSENCE.value
         )
@@ -550,6 +567,9 @@ def _mark_observation_present(observation: VacancyObservationRecord) -> None:
     observation.status = VacancyStatus.ACTIVE.value
     observation.closed_at = None
     observation.closure_evidence = VacancyClosureEvidence.UNKNOWN.value
+    observation.lifecycle_provenance = (
+        VacancyLifecycleProvenance.ACCEPTED_COLLECTION.value
+    )
     observation.missing_complete_snapshots = 0
 
 
@@ -606,12 +626,24 @@ async def _aggregate_canonical_lifecycle(
 
         for canonical in canonical_records:
             linked = observations_by_vacancy.get(canonical.id, [])
-            trustworthy_closure = bool(linked) and all(
-                observation.source_company_id is not None
-                and observation.status == VacancyStatus.CLOSED.value
-                and observation.closed_at is not None
-                and observation.closure_evidence in _AUTHORITATIVE_CLOSURE_EVIDENCE
+            lifecycle_observations = [
+                observation
                 for observation in linked
+                if observation.lifecycle_provenance
+                != VacancyLifecycleProvenance.GENERIC_UPSERT.value
+            ]
+            trustworthy_closure = (
+                bool(lifecycle_observations)
+                and all(
+                    observation.source_company_id is not None for observation in linked
+                )
+                and all(
+                    observation.source_company_id is not None
+                    and observation.status == VacancyStatus.CLOSED.value
+                    and observation.closed_at is not None
+                    and observation.closure_evidence in _AUTHORITATIVE_CLOSURE_EVIDENCE
+                    for observation in lifecycle_observations
+                )
             )
             if not trustworthy_closure:
                 canonical.status = VacancyStatus.ACTIVE.value
@@ -625,7 +657,7 @@ async def _aggregate_canonical_lifecycle(
                 continue
             closure_times = [
                 observation.closed_at
-                for observation in linked
+                for observation in lifecycle_observations
                 if observation.closed_at is not None
             ]
             if transition_at is not None:
@@ -833,7 +865,7 @@ class SQLAlchemyCollectionPersistence:
                 session,
                 result.vacancies,
                 observed_at=health.checked_at,
-                allow_authoritative_evidence=True,
+                accepted_collection=True,
             )
             affected_vacancy_ids = set(upserted.affected_vacancy_ids)
             if result.reconciliation_eligible:
@@ -904,7 +936,7 @@ class SQLAlchemyVacancyRepository:
                 session,
                 vacancies,
                 observed_at=None,
-                allow_authoritative_evidence=False,
+                accepted_collection=False,
             )
             await _aggregate_canonical_lifecycle(
                 session,

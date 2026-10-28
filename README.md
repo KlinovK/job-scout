@@ -172,20 +172,26 @@ complete snapshot metadata. A verified adapter's explicit closed row records
 `provider_explicit` evidence at the accepted collection time when the provider
 supplies no timestamp. The second eligible absence records
 `authoritative_absence`; historical or direct-import closure remains `unknown`.
+hh.ru closure is accepted only from a strict JSON boolean `archived` field;
+coercible strings, numbers, null, and container values are rejected as malformed.
 
-Canonical lifecycle is derived in the same transaction from all linked
-observations. Any active observation, unknown owner, missing closure timestamp,
-or empty observation set keeps the canonical vacancy active. It closes only
-when every observation has attributable, timestamped `provider_explicit` or
-`authoritative_absence` evidence; one source disappearing cannot close a vacancy
-supported elsewhere. Generic vacancy upserts cannot manufacture authoritative
-evidence. Reopening
-clears canonical `closed_at`, repeated closure preserves it, and stale or exact
-replays are rejected before lifecycle mutation. The legacy repair migration
-marks historical evidence `unknown` and reopens ambiguous closed canonical rows
-without modifying observation status, timestamps, ownership, or classifications.
-Lifecycle aggregation uses fixed-size batches below legacy SQLite parameter
-limits while retaining the complete linked observation set for each canonical.
+Canonical lifecycle is derived in the same transaction from linked observations.
+Persisted lifecycle provenance separates accepted collection state from generic
+repository history. Generic observations remain queryable for identity and
+metadata but cannot close or reopen an existing canonical vacancy; a later
+accepted collection can promote the same observation and legitimately reopen
+the canonical. Legacy `unknown` provenance remains conservative. An authoritative
+active observation, unknown owner, missing closure timestamp, or empty
+authoritative observation set keeps the canonical vacancy active. It closes only
+when every lifecycle-participating observation has attributable, timestamped
+`provider_explicit` or `authoritative_absence` evidence; one source disappearing
+cannot close a vacancy supported elsewhere. Reopening clears canonical
+`closed_at`, repeated closure preserves it, and stale or exact replays are
+rejected before lifecycle mutation. The repair migrations mark historical
+evidence and lifecycle provenance `unknown` without modifying observation
+status, timestamps, ownership, or classifications. Lifecycle aggregation uses
+fixed-size batches below legacy SQLite parameter limits while retaining the
+complete linked observation set for each canonical.
 
 ### Explicit retry ownership
 
